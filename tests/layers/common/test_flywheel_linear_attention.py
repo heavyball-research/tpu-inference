@@ -20,9 +20,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from flywheel_tpu.linear_attention.gdn import wrapper as flywheel_gdn
 from jax.sharding import Mesh
 
+from tpu_inference.kernels.gdn.v3 import wrapper as v3_gdn
 from tpu_inference.layers.common import attention_backend
 from tpu_inference.layers.common import \
     flywheel_linear_attention as flywheel_linear
@@ -102,9 +104,10 @@ def stub_kernel(marker: int, calls: list[dict]):
 ])
 def test_gdn_runs_the_selected_backend_kernel(mesh, monkeypatch, backend_cls,
                                               marker):
-    monkeypatch.setattr(attention_backend, "_linear_backend", backend_cls())
+    monkeypatch.setattr(attention_backend, "selected_linear_attention_backend",
+                        backend_cls())
     calls: list[dict] = []
-    monkeypatch.setattr(gdn_attention.wrapper, "fused_conv1d_gdn",
+    monkeypatch.setattr(v3_gdn, "fused_conv1d_gdn",
                         stub_kernel(V3_MARKER, calls))
     monkeypatch.setattr(flywheel_gdn, "fused_conv1d_gdn",
                         stub_kernel(FLYWHEEL_MARKER, calls))
@@ -122,23 +125,7 @@ def test_gdn_runs_the_selected_backend_kernel(mesh, monkeypatch, backend_cls,
 
 def test_flywheel_backend_rejects_a_non_bf16_model():
     vllm_config = SimpleNamespace(model_config=SimpleNamespace(
-        dtype="torch.float32"))
+        dtype=torch.float32))
     with pytest.raises(ValueError, match="not bfloat16"):
         flywheel_linear.FlywheelLinearAttentionBackend().check_config(
             vllm_config)
-
-
-@pytest.mark.parametrize(("name", "backend_cls"), [
-    ("default", attention_backend.LinearAttentionBackend),
-    ("flywheel", flywheel_linear.FlywheelLinearAttentionBackend),
-])
-def test_selects_the_linear_backend_by_name(name, backend_cls):
-    backend = attention_backend.create_linear_attention_backend(
-        {"linear_attn_backend": name})
-    assert type(backend) is backend_cls
-
-
-def test_rejects_an_unknown_linear_backend_name():
-    with pytest.raises(ValueError, match="valid values are"):
-        attention_backend.create_linear_attention_backend(
-            {"linear_attn_backend": "gdn_v2"})

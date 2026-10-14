@@ -357,12 +357,6 @@ class TpuPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
-        # Raises on an unknown additional_config["attention_backend"] or
-        # ["linear_attn_backend"].
-        attention_backend = create_attention_backend(
-            vllm_config.additional_config)
-        linear_attention_backend = create_linear_attention_backend(
-            vllm_config.additional_config)
         cls._resolve_multiprocess_dp(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
@@ -467,8 +461,10 @@ class TpuPlatform(Platform):
                         )
                         cache_config.block_size = min_page_size  # type: ignore[assignment]
 
-        attention_backend.check_config(vllm_config)
-        linear_attention_backend.check_config(vllm_config)
+        create_attention_backend(
+            vllm_config.additional_config).check_config(vllm_config)
+        create_linear_attention_backend(
+            vllm_config.additional_config).check_config(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config

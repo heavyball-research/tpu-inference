@@ -14,13 +14,13 @@
 """The flywheel_tpu fused conv1d + GDN kernel as a linear attention
 backend."""
 
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+import torch
 from flywheel_tpu.linear_attention.gdn import wrapper as gdn_wrapper
 
-from tpu_inference.layers.common.attention_backend import \
-    LinearAttentionBackend
+from tpu_inference.layers.common.attention_backend import (
+    GDNKernel, LinearAttentionBackend)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -35,10 +35,10 @@ class FlywheelLinearAttentionBackend(LinearAttentionBackend):
         # Note (david): the kernel takes bf16 activations and raises on any
         # other dtype at trace time.
         model_dtype = vllm_config.model_config.dtype
-        if str(model_dtype).removeprefix("torch.") != "bfloat16":
+        if model_dtype != torch.bfloat16:
             raise ValueError(
                 "The flywheel linear attention backend cannot serve this "
                 f"configuration: model dtype {model_dtype} is not bfloat16.")
 
-    def gdn_kernel(self) -> Callable[..., Any]:
+    def gdn_kernel(self) -> GDNKernel:
         return gdn_wrapper.fused_conv1d_gdn

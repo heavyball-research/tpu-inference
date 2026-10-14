@@ -118,8 +118,8 @@ class AttentionMetadata(object):
     # STATIC: controls JIT specialization without adding a runtime array.
     use_causal_mask: bool = True
 
-    # Flywheel backend only (attention_backend = "flywheel"); every other
-    # backend leaves the defaults below.
+    # Note (david): flywheel backend only (attention_backend = "flywheel");
+    # every other backend leaves the defaults below.
 
     # STATIC: (batch, seq_len) of a uniform prefill step that runs the dense
     # kernel; -1 when the ragged kernel runs instead.

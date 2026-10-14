@@ -22,7 +22,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from tpu_inference.kernels.gdn.v3 import wrapper
 from tpu_inference.layers.common.attention_backend import \
     get_linear_attention_backend
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -134,11 +133,8 @@ def run_jax_gdn_attention(
 
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
 
-    kernel = get_linear_attention_backend().gdn_kernel()
-    if kernel is None:
-        kernel = wrapper.fused_conv1d_gdn
     p_run_jax_gdn_attention_local = functools.partial(
-        kernel,
+        get_linear_attention_backend().gdn_kernel(),
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
         d_k=d_k,

@@ -790,9 +790,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         is_last_rank: bool = True,
     ):
         self.vllm_config = vllm_config
-        # The attention call sites and the KV cache allocator read these
-        # process-wide backends, so set them before the model and the KV cache
-        # are built.
+        # Note (david): the attention call sites and the KV cache allocator
+        # read these process-wide backends, so set them before the model and
+        # the KV cache are built.
         set_attention_backend(
             create_attention_backend(vllm_config.additional_config))
         set_linear_attention_backend(
