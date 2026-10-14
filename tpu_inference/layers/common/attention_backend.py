@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The TPU attention backend, selected with
---additional-config '{"attention_backend": ...}'.
+"""The TPU attention backends, selected with
+--additional-config '{"attention_backend": ..., "linear_attn_backend": ...}'.
 
 vLLM's --attention-backend picks the framework adapter (PallasAttentionBackend
 registered as FLASH_ATTN), not the TPU kernel behind it, and only accepts the
@@ -24,6 +24,11 @@ compilation manager and attention_interface runs as it is. Another backend
 overrides the hooks it needs, the way a vLLM backend implements
 validate_configuration / get_kv_cache_shape / AttentionMetadataBuilder.build /
 build_for_cudagraph_capture / AttentionImpl.forward.
+
+The linear attention layers of a hybrid model select their kernels apart from
+the full attention ones, like SGLang's --linear-attn-backend, since the two
+families have different kernels. LinearAttentionBackend itself is the
+"default" backend, the GDN v3 kernel.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -43,6 +48,7 @@ if TYPE_CHECKING:
     from tpu_inference.utils import DeviceBuffer
 
 ATTENTION_BACKEND_KEY = "attention_backend"
+LINEAR_ATTN_BACKEND_KEY = "linear_attn_backend"
 
 # (unpacked device buffer, KV cache group id) -> extra AttentionMetadata kwargs
 # of that group.
@@ -154,16 +160,21 @@ ATTENTION_BACKENDS: dict[str, Callable[[], AttentionBackend]] = {
 }
 
 
+def _create_backend(additional_config: Mapping[str, Any], key: str,
+                    default: str, backends: Mapping[str, Callable[[], Any]]):
+    name = additional_config.get(key, default)
+    if name not in backends:
+        raise ValueError(f"Unknown additional_config[{key!r}] {name!r}; "
+                         f"valid values are {tuple(backends)}.")
+    return backends[name]()
+
+
 def create_attention_backend(
         additional_config: Mapping[str, Any]) -> AttentionBackend:
     """The backend vllm_config.additional_config selects; raises on an
     unknown name."""
-    name = additional_config.get(ATTENTION_BACKEND_KEY, "rpa")
-    if name not in ATTENTION_BACKENDS:
-        raise ValueError(
-            f"Unknown additional_config[{ATTENTION_BACKEND_KEY!r}] {name!r}; "
-            f"valid values are {tuple(ATTENTION_BACKENDS)}.")
-    return ATTENTION_BACKENDS[name]()
+    return _create_backend(additional_config, ATTENTION_BACKEND_KEY, "rpa",
+                           ATTENTION_BACKENDS)
 
 
 # Process-wide, because the attention call sites and the KV cache allocator
@@ -180,3 +191,56 @@ def set_attention_backend(backend: AttentionBackend) -> None:
 
 def get_attention_backend() -> AttentionBackend:
     return _backend
+
+
+class LinearAttentionBackend:
+    """The default linear attention backend; see the module docstring."""
+
+    name = "default"
+
+    def check_config(self, vllm_config: "VllmConfig") -> None:
+        """Same contract as AttentionBackend.check_config."""
+
+    def gdn_kernel(self) -> Callable[..., Any] | None:
+        """The fused conv1d + GDN kernel run_jax_gdn_attention shard-maps,
+        with the signature of kernels.gdn.v3.wrapper.fused_conv1d_gdn, or None
+        for that kernel."""
+        return None
+
+
+def _create_default_linear_backend() -> LinearAttentionBackend:
+    return LinearAttentionBackend()
+
+
+def _create_flywheel_linear_backend() -> LinearAttentionBackend:
+    from tpu_inference.layers.common.flywheel_linear_attention import \
+        FlywheelLinearAttentionBackend
+    return FlywheelLinearAttentionBackend()
+
+
+LINEAR_ATTN_BACKENDS: dict[str, Callable[[], LinearAttentionBackend]] = {
+    "default": _create_default_linear_backend,
+    "flywheel": _create_flywheel_linear_backend,
+}
+
+
+def create_linear_attention_backend(
+        additional_config: Mapping[str, Any]) -> LinearAttentionBackend:
+    """The linear attention backend vllm_config.additional_config selects;
+    raises on an unknown name."""
+    return _create_backend(additional_config, LINEAR_ATTN_BACKEND_KEY,
+                           "default", LINEAR_ATTN_BACKENDS)
+
+
+# Process-wide for the same reason as the attention backend, and set at the
+# same point.
+_linear_backend: LinearAttentionBackend = LinearAttentionBackend()
+
+
+def set_linear_attention_backend(backend: LinearAttentionBackend) -> None:
+    global _linear_backend
+    _linear_backend = backend
+
+
+def get_linear_attention_backend() -> LinearAttentionBackend:
+    return _linear_backend

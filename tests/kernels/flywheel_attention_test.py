@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""flywheel_tpu backend wrapper against the RPA v3 reference on one cache."""
+"""flywheel_tpu backend wrapper against ref_ragged_paged_attention, the eager
+reference of the RPA v3 tests, on one cache."""
 
 import jax
 import jax.numpy as jnp
@@ -48,7 +49,7 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                  is_dense: bool = False,
                  phase: str | None = None) -> None:
         """Run one step of seq_lens [(q_len, kv_len)], decode rows first, and
-        compare output and updated cache against the RPA v3 reference.
+        compare output and updated cache against ref_ragged_paged_attention.
 
         is_dense routes the prefill through the dense kernel, which needs every
         request fresh, of one length, and filling num_tokens exactly. phase

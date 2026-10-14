@@ -52,8 +52,8 @@ import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
 from tpu_inference.layers.common.attention_backend import (
-    HostStepInputs, create_attention_backend, get_attention_backend,
-    set_attention_backend)
+    HostStepInputs, create_attention_backend, create_linear_attention_backend,
+    get_attention_backend, set_attention_backend, set_linear_attention_backend)
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
@@ -790,11 +790,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         is_last_rank: bool = True,
     ):
         self.vllm_config = vllm_config
-        # The attention call sites and the KV cache allocator read this
-        # process-wide backend, so set it before the model and the KV cache are
-        # built.
+        # The attention call sites and the KV cache allocator read these
+        # process-wide backends, so set them before the model and the KV cache
+        # are built.
         set_attention_backend(
             create_attention_backend(vllm_config.additional_config))
+        set_linear_attention_backend(
+            create_linear_attention_backend(vllm_config.additional_config))
         self.model_config = vllm_config.model_config
         # TODO(jevinjiang): override block size based on RPA v3.
         self.cache_config = vllm_config.cache_config
