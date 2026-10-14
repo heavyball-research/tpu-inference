@@ -82,6 +82,8 @@ if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "synchronize"):
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from tpu_inference import envs
+from tpu_inference.layers.common.attention_backend import \
+    create_attention_backend
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 
@@ -355,6 +357,9 @@ class TpuPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
+        # Raises on an unknown additional_config["attention_backend"].
+        attention_backend = create_attention_backend(
+            vllm_config.additional_config)
         cls._resolve_multiprocess_dp(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
@@ -458,6 +463,8 @@ class TpuPlatform(Platform):
                             min_page_size,
                         )
                         cache_config.block_size = min_page_size  # type: ignore[assignment]
+
+        attention_backend.check_config(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config

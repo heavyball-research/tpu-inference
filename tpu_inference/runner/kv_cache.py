@@ -31,6 +31,7 @@ else:
     import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
 
 from tpu_inference import utils
+from tpu_inference.layers.common.attention_backend import get_attention_backend
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import to_jax_dtype
@@ -87,6 +88,13 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                 kv_dtype,
                 envs.MLA_KV_PACKING_SIZE,
                 transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE))
+    elif (backend_shape := get_attention_backend().get_kv_cache_shape(
+            total_num_pages, physical_block_size,
+            actual_num_kv_heads // model_cnt, actual_head_dim,
+            kv_dtype)) is not None:
+        assert actual_num_kv_heads % model_cnt == 0
+        shape = list(backend_shape)
+        shape[2] *= model_cnt
     else:
         assert actual_num_kv_heads % model_cnt == 0
         get_kv_cache_shape_fn = (

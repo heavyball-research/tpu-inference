@@ -28,6 +28,7 @@ from vllm.utils.math_utils import round_down
 import tpu_inference.envs as envs
 from tpu_inference.core.disagg_utils import is_disagg_enabled
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
+from tpu_inference.layers.common.attention_backend import get_attention_backend
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -373,6 +374,19 @@ class CompilationManager:
                 num_tokens=num_tokens,
             )
 
+    def _precompile_backbone_variants(self, name, **kwargs) -> None:
+        """_precompile_backbone_helper once per backbone executable the
+        attention backend can ask for at this token bucket."""
+        token_source = (kwargs["input_ids"] if kwargs["input_ids"] is not None
+                        else kwargs["inputs_embeds"])
+        for variant in get_attention_backend().warmup_variants(
+                token_source.shape[0], self.runner.num_tokens_paddings,
+                self.runner.max_num_reqs,
+                self.runner.vllm_config.sharding_config.total_dp_size):
+            self._precompile_backbone_helper(name,
+                                             **kwargs,
+                                             attention_variant=variant)
+
     def _precompile_backbone_helper(self,
                                     name,
                                     *,
@@ -384,7 +398,8 @@ class CompilationManager:
                                     is_last_rank=True,
                                     num_reqs: int,
                                     pcp_has_cached_kv: bool = False,
-                                    pcp_num_reqs: int = 1) -> None:
+                                    pcp_num_reqs: int = 1,
+                                    attention_variant=None) -> None:
         num_tokens = None
         if input_ids is not None:
             num_tokens = input_ids.shape[0]
@@ -412,6 +427,18 @@ class CompilationManager:
                                              metadata_attn_sharding)
         query_start_loc = self._create_dummy_tensor(
             (attn_seqs + dp_size, ), jnp.int32, metadata_attn_sharding)
+        attention_backend = get_attention_backend()
+        if attention_backend.zero_warmup_lengths:
+            seq_lens = jnp.zeros_like(seq_lens)
+            query_start_loc = jnp.zeros_like(query_start_loc)
+        attention_fields, attention_arrays = attention_backend.prepare_warmup(
+            attention_variant,
+            self.runner.kv_cache_config.kv_cache_groups,
+            num_tokens=num_tokens,
+            max_num_reqs=self.runner.max_num_reqs,
+            dp_size=dp_size,
+            mesh=self.runner.mesh,
+            sharding=metadata_attn_sharding)
 
         # Keep existing pattern for specific value arrays
         request_distribution = np.array([0, 0, 0] * dp_size, dtype=np.int32)
@@ -475,7 +502,8 @@ class CompilationManager:
                                         sharding=metadata_attn_sharding)
             return block_tables
 
-        def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
+        def build_attn(block_tables: jax.Array | None,
+                       gid: int) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
                 input_positions=positions,
                 block_tables=block_tables,
@@ -485,6 +513,7 @@ class CompilationManager:
                 mamba_state_indices=mamba_state_indices,
                 padded_num_reqs=num_reqs,
                 pcp=pcp,
+                **attention_fields(attention_arrays, gid),
             )
 
             return attention_metadata_gid
@@ -505,14 +534,14 @@ class CompilationManager:
             # Pooling model will not using kv cache
             no_kv_cache = len(self.runner.kv_cache_config.kv_cache_groups) == 0
             block_tables = build_block_table(0) if not no_kv_cache else None
-            attention_metadata = build_attn(block_tables)
+            attention_metadata = build_attn(block_tables, 0)
             shared_attention_metadata = build_shared_attn()
         else:
             # Must mirror the runtime structure built in `_prepare_inputs`, or
             # the precompiled executable does not match and we recompile.
             attention_metadata = GroupedAttentionMetadata(
                 groups=tuple(
-                    build_attn(build_block_table(gid)) for gid in range(
+                    build_attn(build_block_table(gid), gid) for gid in range(
                         len(self.runner.kv_cache_config.kv_cache_groups))),
                 layer_names_per_group=tuple(
                     tuple(group.layer_names)
@@ -739,7 +768,7 @@ class CompilationManager:
                 _cache_rungs = (False, True) if _pcp > 1 else (False, )
                 for _has_cached_kv in _cache_rungs:
                     for _pcp_reqs in self.runner.pcp_num_reqs_paddings:
-                        self._precompile_backbone_helper(
+                        self._precompile_backbone_variants(
                             f"worker{self.runner.rank} backbone",
                             input_ids=input_ids,
                             positions=positions,
@@ -814,7 +843,7 @@ class CompilationManager:
                         })
                 else:
                     intermediate_tensors = None
-                self._precompile_backbone_helper(
+                self._precompile_backbone_variants(
                     f"worker{self.runner.rank} backbone with embeds",
                     input_ids=None,
                     positions=positions,
