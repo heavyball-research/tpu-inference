@@ -99,20 +99,21 @@ def stub_kernel(marker: int, calls: list[dict]):
 
 
 @pytest.mark.parametrize(("backend_cls", "marker"), [
+    (None, V3_MARKER),
     (attention_backend.LinearAttentionBackend, V3_MARKER),
     (flywheel_linear.FlywheelLinearAttentionBackend, FLYWHEEL_MARKER),
 ])
 def test_gdn_runs_the_selected_backend_kernel(mesh, monkeypatch, backend_cls,
                                               marker):
-    monkeypatch.setattr(attention_backend, "selected_linear_attention_backend",
-                        backend_cls())
     calls: list[dict] = []
     monkeypatch.setattr(v3_gdn, "fused_conv1d_gdn",
                         stub_kernel(V3_MARKER, calls))
     monkeypatch.setattr(flywheel_gdn, "fused_conv1d_gdn",
                         stub_kernel(FLYWHEEL_MARKER, calls))
+    gdn_kernel = backend_cls().gdn_kernel() if backend_cls else None
 
-    states, output = gdn_attention.run_jax_gdn_attention(**make_inputs(mesh))
+    states, output = gdn_attention.run_jax_gdn_attention(**make_inputs(mesh),
+                                                         gdn_kernel=gdn_kernel)
 
     np.testing.assert_array_equal(output.astype(jnp.float32), marker)
     for state in states:

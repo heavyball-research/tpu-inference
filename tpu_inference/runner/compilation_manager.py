@@ -28,8 +28,7 @@ from vllm.utils.math_utils import round_down
 import tpu_inference.envs as envs
 from tpu_inference.core.disagg_utils import is_disagg_enabled
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
-from tpu_inference.layers.common.attention_backend import (
-    AttentionFields, get_attention_backend)
+from tpu_inference.layers.common.attention_backend import AttentionFields
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -411,7 +410,7 @@ class CompilationManager:
         # Under PCP each request becomes two fused seqs, so the attention
         # metadata buffers are twice as wide (see runner.attn_max_num_seqs).
         attn_seqs = self.runner.attn_max_num_seqs
-        attention_backend = get_attention_backend()
+        attention_backend = self.runner.attention_backend
         if attention_backend.zero_warmup_lengths:
             seq_lens = device_array(self.runner.mesh,
                                     np.zeros((attn_seqs, ), dtype=np.int32),
@@ -756,7 +755,7 @@ class CompilationManager:
                             "hidden_states": hidden_states,
                             "residual": residual
                         })
-                attention_variants = get_attention_backend().warmup_variants(
+                attention_variants = self.runner.attention_backend.warmup_variants(
                     self.runner.kv_cache_config.kv_cache_groups,
                     num_tokens=num_tokens,
                     num_tokens_paddings=self.runner.num_tokens_paddings,
@@ -845,7 +844,7 @@ class CompilationManager:
                         })
                 else:
                     intermediate_tensors = None
-                attention_variants = get_attention_backend().warmup_variants(
+                attention_variants = self.runner.attention_backend.warmup_variants(
                     self.runner.kv_cache_config.kv_cache_groups,
                     num_tokens=num_tokens,
                     num_tokens_paddings=self.runner.num_tokens_paddings,

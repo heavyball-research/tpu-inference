@@ -11,12 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The TPU attention backends, selected with
---additional-config '{"attention_backend": ..., "linear_attn_backend": ...}'.
+"""The TPU attention backends, selected with --attention-backend (e.g.
+"flywheel"), which picks the attention and the linear attention backend of
+that name.
 
-vLLM's --attention-backend picks the framework adapter (PallasAttentionBackend
-registered as FLASH_ATTN), not the TPU kernel behind it, and only accepts the
-names of its closed AttentionBackendEnum, so the kernel is selected here.
+vLLM's --attention-backend picks the framework adapter, not the TPU kernel
+behind it. register_vllm_attention_backends adds the names of
+VLLM_ATTENTION_BACKENDS to vLLM's AttentionBackendEnum, so that the flag
+accepts them, and TpuPlatform.get_attn_backend_cls maps each name to its
+adapter: PallasAttentionBackend with an impl that passes the name on to
+attention_interface.attention. The runner, the KV cache allocator and the GDN
+op read the same name from vllm_config (attention_backend_name). JAX
+(flax_nnx) models call attention() without a backend and run RPA.
 
 AttentionBackend itself is the default "rpa" backend: each hook returns
 nothing to add, and the RPA code inline in the platform, the runner, the
@@ -25,15 +31,15 @@ overrides the hooks it needs, the way a vLLM backend implements
 validate_configuration / get_kv_cache_shape / AttentionMetadataBuilder.build /
 build_for_cudagraph_capture / AttentionImpl.forward.
 
-The linear attention layers of a hybrid model select their kernels apart from
-the full attention ones, like SGLang's --linear-attn-backend, since the two
-families have different kernels. LinearAttentionBackend itself is the
-"default" backend, the GDN v3 kernel.
+The linear attention layers of a hybrid model have kernels of their own, in
+LINEAR_ATTN_BACKENDS; for now one name selects both families. A name without
+a linear attention backend keeps LinearAttentionBackend, the "default"
+backend, the GDN v3 kernel.
 """
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -162,36 +168,6 @@ ATTENTION_BACKENDS: dict[str, Callable[[], AttentionBackend]] = {
     "flywheel": create_flywheel_backend,
 }
 
-
-def create_attention_backend(
-        additional_config: Mapping[str, Any]) -> AttentionBackend:
-    """The backend vllm_config.additional_config selects; raises on an
-    unknown name."""
-    name = additional_config.get("attention_backend", "rpa")
-    if name in ATTENTION_BACKENDS:
-        return ATTENTION_BACKENDS[name]()
-    else:
-        raise ValueError(
-            f"Unknown additional_config['attention_backend'] {name!r}; "
-            f"valid values are {tuple(ATTENTION_BACKENDS)}.")
-
-
-# Note (david): process-wide, because the attention call sites and the KV
-# cache allocator have no vllm_config of their own. TPUModelRunner sets it
-# from vllm_config before it builds the model and the KV cache; until then it
-# is the default backend, the upstream behavior for code without a runner.
-selected_attention_backend: AttentionBackend = AttentionBackend()
-
-
-def set_attention_backend(backend: AttentionBackend) -> None:
-    global selected_attention_backend
-    selected_attention_backend = backend
-
-
-def get_attention_backend() -> AttentionBackend:
-    return selected_attention_backend
-
-
 GDNKernel = Callable[..., tuple[tuple["jax.Array", "jax.Array"], "jax.Array"]]
 
 
@@ -223,30 +199,78 @@ LINEAR_ATTN_BACKENDS: dict[str, Callable[[], LinearAttentionBackend]] = {
     "flywheel": create_flywheel_linear_backend,
 }
 
+# The vLLM backend class that TpuPlatform.get_attn_backend_cls returns for each
+# name besides "rpa" (vLLM's FLASH_ATTN, PallasAttentionBackend).
+VLLM_ATTENTION_BACKENDS: dict[str, str] = {
+    "flywheel":
+    "tpu_inference.layers.vllm.backends.flywheel.FlywheelPallasAttentionBackend",
+}
 
-def create_linear_attention_backend(
-        additional_config: Mapping[str, Any]) -> LinearAttentionBackend:
-    """The linear attention backend vllm_config.additional_config selects;
-    raises on an unknown name."""
-    name = additional_config.get("linear_attn_backend", "default")
-    if name in LINEAR_ATTN_BACKENDS:
-        return LINEAR_ATTN_BACKENDS[name]()
-    else:
+
+def register_vllm_attention_backends() -> None:
+    """Add the names of VLLM_ATTENTION_BACKENDS to vLLM's AttentionBackendEnum,
+    so that --attention-backend accepts them. Runs from the
+    vllm.general_plugins hook, which vLLM calls in every process, and before
+    it parses the flag."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    if not hasattr(AttentionBackendEnum, "register"):
+        # vLLM before vllm#41091 cannot add a name.
+        return
+    for name, class_path in VLLM_ATTENTION_BACKENDS.items():
+        if name.upper() not in AttentionBackendEnum.__members__:
+            AttentionBackendEnum.register(name.upper(), class_path)
+
+
+def attention_backend_name(vllm_config: "VllmConfig") -> str:
+    """The backend --attention-backend selects: a name of
+    VLLM_ATTENTION_BACKENDS, else "rpa" (FLASH_ATTN, no flag, or a backend vLLM
+    picked itself, such as TRITON_ATTN for Gemma-4)."""
+    backend = vllm_config.attention_config.backend
+    if backend is not None and backend.name.lower() in VLLM_ATTENTION_BACKENDS:
+        return backend.name.lower()
+    return AttentionBackend.name
+
+
+def create_attention_backend(name: str) -> AttentionBackend:
+    """The attention backend of that name."""
+    return ATTENTION_BACKENDS[name]()
+
+
+def create_linear_attention_backend(name: str) -> LinearAttentionBackend:
+    """The linear attention backend of that name, or the default one when the
+    name only selects an attention backend."""
+    return LINEAR_ATTN_BACKENDS.get(name, LinearAttentionBackend)()
+
+
+def check_attention_backend_config(vllm_config: "VllmConfig") -> None:
+    """Raise for an engine configuration the selected backends cannot serve.
+    Runs in TpuPlatform.check_and_update_config, before any worker starts."""
+    name = attention_backend_name(vllm_config)
+    if name != AttentionBackend.name:
+        check_forked_single_host(name)
+    create_attention_backend(name).check_config(vllm_config)
+    create_linear_attention_backend(name).check_config(vllm_config)
+
+
+def check_forked_single_host(name: str) -> None:
+    """Raise unless vllm_config only reaches forked processes.
+
+    register_vllm_attention_backends adds the member for name at runtime.
+    Enum members pickle by value, and a process that unpickles vllm_config
+    before it loads the plugins, a spawned EngineCore or a Ray worker, cannot
+    rebuild the member. A forked process inherits it."""
+    from vllm import envs as vllm_envs
+    from vllm.ray.lazy_utils import is_in_ray_actor
+
+    from tpu_inference import envs
+    reasons = []
+    if envs.TPU_MULTIHOST_BACKEND == "ray":
+        reasons.append("TPU_MULTIHOST_BACKEND=ray")
+    if vllm_envs.VLLM_WORKER_MULTIPROC_METHOD == "spawn":
+        reasons.append("VLLM_WORKER_MULTIPROC_METHOD=spawn")
+    if is_in_ray_actor():
+        reasons.append("the engine runs in a Ray actor")
+    if reasons:
         raise ValueError(
-            f"Unknown additional_config['linear_attn_backend'] {name!r}; "
-            f"valid values are {tuple(LINEAR_ATTN_BACKENDS)}.")
-
-
-# Note (david): process-wide for the same reason as the attention backend, and
-# set at the same point.
-selected_linear_attention_backend: LinearAttentionBackend = (
-    LinearAttentionBackend())
-
-
-def set_linear_attention_backend(backend: LinearAttentionBackend) -> None:
-    global selected_linear_attention_backend
-    selected_linear_attention_backend = backend
-
-
-def get_linear_attention_backend() -> LinearAttentionBackend:
-    return selected_linear_attention_backend
+            f"--attention-backend {name} supports a single host with forked "
+            f"processes only, not: {', '.join(reasons)}.")

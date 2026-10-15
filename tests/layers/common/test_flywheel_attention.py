@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from tpu_inference.layers.common import attention_backend, attention_interface
+from tpu_inference.layers.common import attention_interface
 from tpu_inference.layers.common import flywheel_attention as fa
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
@@ -39,12 +39,6 @@ def mesh() -> Mesh:
     """One CPU device over the axes the dispatch path reads."""
     devices = np.array([jax.devices("cpu")[0]])
     return Mesh(devices.reshape((-1, 1, 1)), ("data", "attn_dp", "model"))
-
-
-@pytest.fixture
-def flywheel_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(attention_backend, "selected_attention_backend",
-                        fa.FlywheelAttentionBackend())
 
 
 def build_metadata() -> tuple[AttentionMetadata, SharedAttentionMetadata]:
@@ -84,11 +78,16 @@ class TestDispatch:
         q = jnp.ones((TOTAL_TOKENS, NUM_HEADS, HEAD_DIM), jnp.bfloat16)
         k = jnp.ones((TOTAL_TOKENS, NUM_KV_HEADS, HEAD_DIM), jnp.bfloat16)
         v = jnp.ones((TOTAL_TOKENS, NUM_KV_HEADS, HEAD_DIM), jnp.bfloat16)
+        backend = fa.FlywheelAttentionBackend()
         kv_cache = jnp.zeros(
-            kv_cache_mod.get_kv_cache_shape_with_mesh(mesh, NUM_BLOCKS,
-                                                      BLOCK_SIZE, NUM_KV_HEADS,
-                                                      HEAD_DIM, jnp.bfloat16),
-            jnp.bfloat16)
+            kv_cache_mod.get_kv_cache_shape_with_mesh(
+                mesh,
+                NUM_BLOCKS,
+                BLOCK_SIZE,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                jnp.bfloat16,
+                attention_backend=backend), jnp.bfloat16)
         wrapper = MagicMock(return_value=(jnp.ones(q.shape, q.dtype),
                                           kv_cache))
         monkeypatch.setattr(fa, "sharded_flywheel_tpu_attention", wrapper)
@@ -101,11 +100,11 @@ class TestDispatch:
             attention_metadata=md,
             mesh=mesh,
             shared_attention_metadata=shared,
+            attention_backend=backend,
             **overrides)
         return wrapper, result
 
-    def test_routes_to_flywheel_wrapper(self, mesh, flywheel_flag,
-                                        monkeypatch):
+    def test_routes_to_flywheel_wrapper(self, mesh, monkeypatch):
         wrapper, (kv_cache, output) = self.run_attention(mesh, monkeypatch)
         wrapper.assert_called_once()
         args, kwargs = wrapper.call_args
@@ -131,9 +130,8 @@ class TestDispatch:
         ("attention_chunk_size", 512, "attention_chunk_size"),
         ("q_scale", 0.5, "q_scale"),
     ])
-    def test_rejects_unsupported_features(self, mesh, flywheel_flag,
-                                          monkeypatch, option, value,
-                                          expected):
+    def test_rejects_unsupported_features(self, mesh, monkeypatch, option,
+                                          value, expected):
         with pytest.raises(NotImplementedError) as excinfo:
             self.run_attention(mesh, monkeypatch, **{option: value})
         assert expected in str(excinfo.value)

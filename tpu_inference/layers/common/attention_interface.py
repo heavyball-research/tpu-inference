@@ -34,7 +34,7 @@ from tpu_inference.kernels.flash_attention.kernel import (
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from tpu_inference.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
-from tpu_inference.layers.common.attention_backend import get_attention_backend
+from tpu_inference.layers.common.attention_backend import AttentionBackend
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.cp_attention import dcp_forward, pcp_forward
@@ -553,7 +553,10 @@ def attention(
     shared_attention_metadata: SharedAttentionMetadata | None = None,
     attn_logits_soft_cap: float | None = None,
     decode_query_size: int = 1,
+    attention_backend: AttentionBackend | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
+    # attention_backend: the TPU kernel the vLLM adapter selected; None (JAX
+    # models) runs RPA.
     # T: seq_len
     # N: num_heads
     # K: num_kv_heads
@@ -578,7 +581,7 @@ def attention(
     # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
     shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
 
-    backend_result = get_attention_backend().attention(
+    backend_result = (attention_backend or AttentionBackend()).attention(
         kv_cache,
         q,
         k,

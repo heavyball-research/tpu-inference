@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class FlywheelLinearAttentionBackend(LinearAttentionBackend):
-    """additional_config["linear_attn_backend"] = "flywheel"."""
+    """--attention-backend flywheel."""
 
     name = "flywheel"
 

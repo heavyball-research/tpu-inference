@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """FlyWheel TPU attention backend
-(additional_config["attention_backend"] = "flywheel")."""
+(--attention-backend flywheel)."""
 
 import math
 from collections.abc import Mapping, Sequence
@@ -767,7 +767,7 @@ class FlywheelStepFields:
 
 
 class FlywheelAttentionBackend(AttentionBackend):
-    """additional_config["attention_backend"] = "flywheel"."""
+    """--attention-backend flywheel."""
 
     name = "flywheel"
 
