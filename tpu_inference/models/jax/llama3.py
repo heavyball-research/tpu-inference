@@ -25,6 +25,8 @@ from vllm.transformers_utils.config import set_default_rope_theta
 
 from tpu_inference import utils
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
+from tpu_inference.layers.common.attention_backend import (
+    create_attention_backend, model_attention_backend_name)
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
@@ -113,6 +115,7 @@ class LlamaAttention(nnx.Module):
                                                        sharding_size)
 
         self.mesh = mesh
+        self.attention_backend = model_attention_backend_name()
 
         self.q_proj = nnx.Einsum(
             "TD,DNH->TNH",
@@ -192,6 +195,7 @@ class LlamaAttention(nnx.Module):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            attention_backend=create_attention_backend(self.attention_backend),
         )
         # (T, D)
         o = self.o_proj(outputs)

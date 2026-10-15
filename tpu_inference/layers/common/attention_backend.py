@@ -21,8 +21,10 @@ VLLM_ATTENTION_BACKENDS to vLLM's AttentionBackendEnum, so that the flag
 accepts them, and TpuPlatform.get_attn_backend_cls maps each name to its
 adapter: PallasAttentionBackend with an impl that passes the name on to
 attention_interface.attention. The runner, the KV cache allocator and the GDN
-op read the same name from vllm_config (attention_backend_name). JAX
-(flax_nnx) models call attention() without a backend and run RPA.
+op read the same name from vllm_config (attention_backend_name). A JAX
+(flax_nnx) attention layer reads it when the model is built
+(model_attention_backend_name) and passes it on the same way, so that its
+kernel matches the KV cache layout the runner allocates.
 
 AttentionBackend itself is the default "rpa" backend: each hook returns
 nothing to add, and the RPA code inline in the platform, the runner, the
@@ -229,6 +231,24 @@ def attention_backend_name(vllm_config: "VllmConfig") -> str:
     if backend is not None and backend.name.lower() in VLLM_ATTENTION_BACKENDS:
         return backend.name.lower()
     return AttentionBackend.name
+
+
+def model_attention_backend_name() -> str:
+    """attention_backend_name of the model being built, for a JAX attention
+    layer to pass to attention_interface.attention. TPUModelRunner.load_model
+    builds the model (and the drafter) inside set_current_vllm_config."""
+    from vllm.config import get_current_vllm_config
+    return attention_backend_name(get_current_vllm_config())
+
+
+def require_rpa_attention_backend(layer: str) -> None:
+    """Raise unless --attention-backend selects RPA, for a JAX attention layer
+    that calls the RPA kernel itself instead of attention_interface.attention:
+    another backend's KV cache layout does not fit that kernel."""
+    name = model_attention_backend_name()
+    if name != AttentionBackend.name:
+        raise ValueError(f"{layer} calls the RPA kernel directly and does not "
+                         f"support --attention-backend {name}.")
 
 
 def create_attention_backend(name: str) -> AttentionBackend:

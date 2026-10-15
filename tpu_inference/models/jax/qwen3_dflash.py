@@ -23,6 +23,8 @@ from transformers import Qwen3Config
 from vllm.config import VllmConfig
 
 from tpu_inference import utils
+from tpu_inference.layers.common.attention_backend import (
+    create_attention_backend, model_attention_backend_name)
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
@@ -89,6 +91,7 @@ class Qwen3DFlashAttention(nnx.Module):
                                                        sharding_size)
 
         self.mesh = mesh
+        self.attention_backend = model_attention_backend_name()
         self.dflash_attention_impl = dflash_attention_impl
         if max_query_len <= 0:
             raise ValueError(f"{max_query_len=} must be positive.")
@@ -212,6 +215,8 @@ class Qwen3DFlashAttention(nnx.Module):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 use_causal_mask=False,
+                attention_backend=create_attention_backend(
+                    self.attention_backend),
             )
         elif self.dflash_attention_impl == "concat_dense":
             q_target = jnp.zeros(
@@ -242,6 +247,8 @@ class Qwen3DFlashAttention(nnx.Module):
                 v_scale=v_scale,
                 use_causal_mask=True,
                 update_kv_cache=True,
+                attention_backend=create_attention_backend(
+                    self.attention_backend),
             )
 
             # Step 2: Compute attention for noise tokens against the full global cache
@@ -262,6 +269,8 @@ class Qwen3DFlashAttention(nnx.Module):
                 v_scale=v_scale,
                 use_causal_mask=False,
                 update_kv_cache=True,
+                attention_backend=create_attention_backend(
+                    self.attention_backend),
             )
         else:
             raise ValueError(

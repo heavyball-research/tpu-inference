@@ -67,6 +67,7 @@ def _build_stub_attention(impl: str) -> Qwen3DFlashAttention:
     _set("rope_theta", 10000.0)
     _set("rope_scaling", None)
     _set("mesh", object())
+    _set("attention_backend", "rpa")
     _set("dflash_attention_impl", impl)
     _set("max_query_len", 2)
     _set("kv_cache_quantized_dtype", None)

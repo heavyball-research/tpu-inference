@@ -24,6 +24,8 @@ from transformers import Qwen3Config
 from vllm.config import VllmConfig
 
 from tpu_inference import utils
+from tpu_inference.layers.common.attention_backend import (
+    create_attention_backend, model_attention_backend_name)
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.linear import JaxLmHead
@@ -82,6 +84,7 @@ class DFlashAttention(nnx.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
 
         self.mesh = mesh
+        self.attention_backend = model_attention_backend_name()
 
         self.q_proj = nnx.Einsum(
             "TD,DNH->TNH",
@@ -182,6 +185,7 @@ class DFlashAttention(nnx.Module):
             sm_scale=self.head_dim_original**-0.5,
             use_causal_mask=True,
             update_kv_cache=True,
+            attention_backend=create_attention_backend(self.attention_backend),
         )
 
         # Step 2: Write noise tokens to KV cache and compute attention
@@ -200,6 +204,7 @@ class DFlashAttention(nnx.Module):
             sm_scale=self.head_dim_original**-0.5,
             use_causal_mask=False,  # Noise tokens attend to all KV tokens
             update_kv_cache=True,
+            attention_backend=create_attention_backend(self.attention_backend),
         )
 
         # attn_out is already (T_noise, num_heads, head_dim)

@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import set_current_vllm_config
 from vllm.config.attention import AttentionConfig
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -107,6 +108,29 @@ def test_rejects_a_config_that_crosses_a_process_boundary(
     with pytest.raises(ValueError, match=f"{env}={value}"):
         attention_backend.check_attention_backend_config(
             make_vllm_config("flywheel"))
+
+
+@pytest.mark.parametrize(("backend", "name"), [("flywheel", "flywheel"),
+                                               (None, "rpa")])
+def test_jax_layers_read_the_backend_of_the_model_being_built(backend, name):
+    with set_current_vllm_config(make_vllm_config(backend)):
+        assert attention_backend.model_attention_backend_name() == name
+
+
+def test_jax_layers_need_the_model_being_built():
+    with pytest.raises(AssertionError, match="Current vLLM config is not set"):
+        attention_backend.model_attention_backend_name()
+
+
+def test_rpa_only_layer_rejects_another_backend():
+    with set_current_vllm_config(make_vllm_config(None)):
+        attention_backend.require_rpa_attention_backend("GptOssAttention")
+    with set_current_vllm_config(make_vllm_config("flywheel")):
+        with pytest.raises(ValueError,
+                           match="GptOssAttention calls the RPA kernel "
+                           "directly and does not support "
+                           "--attention-backend flywheel"):
+            attention_backend.require_rpa_attention_backend("GptOssAttention")
 
 
 def test_default_backend_skips_the_process_check(monkeypatch):

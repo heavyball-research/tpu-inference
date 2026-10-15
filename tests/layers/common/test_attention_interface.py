@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+from tpu_inference.layers.common.attention_backend import AttentionBackend
 from tpu_inference.layers.common.attention_interface import (
     attention, mla_attention, segment_ids_from_cu_seqlens,
     sharded_ragged_paged_attention)
@@ -140,6 +141,7 @@ def _test_attention(monkeypatch,
         sinks=sinks,
         use_causal_mask=attention_use_causal_mask,
         shared_attention_metadata=shared_attention_metadata,
+        attention_backend=AttentionBackend(),
     )
 
     # 3. Assert
@@ -645,6 +647,7 @@ def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128):
         head_dim_original=head_dim,
         sinks=None,
         shared_attention_metadata=shared_attention_metadata,
+        attention_backend=AttentionBackend(),
     )
     mock_kernel.assert_called_once()
     return mock_kernel.call_args.kwargs

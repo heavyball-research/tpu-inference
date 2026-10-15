@@ -124,6 +124,22 @@ def _prewarm_jax_compilation_cache():
         compilation_cache._initialize_cache()
 
 
+@pytest.fixture
+def default_vllm_config():
+    """A default VllmConfig as the current vLLM config, as vLLM's fixture of
+    that name provides, for a test that builds layers outside
+    TPUModelRunner.load_model: a JAX attention layer reads the attention
+    backend from it (model_attention_backend_name). TpuPlatform's
+    check_and_update_config needs a model_config, so it does not run."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.platforms import current_platform
+
+    with patch.object(current_platform, "check_and_update_config"):
+        vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        yield vllm_config
+
+
 @pytest.fixture(autouse=True)
 def _handle_disable_jax_cache_marker(request):
     """

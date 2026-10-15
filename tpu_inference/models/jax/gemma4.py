@@ -26,6 +26,8 @@ from vllm.model_executor.models.utils import WeightsMapper
 
 from tpu_inference import utils
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
+from tpu_inference.layers.common.attention_backend import (
+    create_attention_backend, model_attention_backend_name)
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
@@ -292,6 +294,7 @@ class Gemma4Attention(JaxModule):
         self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
 
         self.mesh = mesh
+        self.attention_backend = model_attention_backend_name()
 
         # Shard k/v projections along the kv-heads dimension when num_kv_heads
         # is divisible by tp_size — this matches the ragged-paged-attention
@@ -493,6 +496,7 @@ class Gemma4Attention(JaxModule):
             v_scale=v_scale,
             update_kv_cache=not self.is_kv_shared_layer,
             decode_query_size=self.decode_query_size,
+            attention_backend=create_attention_backend(self.attention_backend),
         )
         # (T, D)
         o = self.o_proj(outputs)

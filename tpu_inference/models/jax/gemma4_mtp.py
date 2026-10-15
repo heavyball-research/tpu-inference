@@ -22,6 +22,8 @@ from transformers import Gemma4TextConfig
 from vllm.config import VllmConfig
 
 from tpu_inference import utils
+from tpu_inference.layers.common.attention_backend import (
+    create_attention_backend, model_attention_backend_name)
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.jax import JaxModule
@@ -201,6 +203,7 @@ class Gemma4MTPAttention(JaxModule):
 
         self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
         self.mesh = mesh
+        self.attention_backend = model_attention_backend_name()
 
         self.q_proj = JaxEinsum(
             "TD,DNH->TNH",
@@ -281,6 +284,7 @@ class Gemma4MTPAttention(JaxModule):
             sm_scale=self.scaling,
             attention_chunk_size=self.sliding_window,
             update_kv_cache=False,  # Read-only shared cache query
+            attention_backend=create_attention_backend(self.attention_backend),
         )
         o = self.o_proj(outputs)
         return new_kv_cache, o

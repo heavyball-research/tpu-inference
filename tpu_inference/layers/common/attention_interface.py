@@ -553,10 +553,12 @@ def attention(
     shared_attention_metadata: SharedAttentionMetadata | None = None,
     attn_logits_soft_cap: float | None = None,
     decode_query_size: int = 1,
-    attention_backend: AttentionBackend | None = None,
+    *,
+    attention_backend: AttentionBackend,
 ) -> Tuple[jax.Array, jax.Array]:
-    # attention_backend: the TPU kernel the vLLM adapter selected; None (JAX
-    # models) runs RPA.
+    # attention_backend: the TPU kernel the caller's layer selected (the vLLM
+    # adapter's impl, or a JAX layer from model_attention_backend_name), the
+    # one whose KV cache layout the runner allocated.
     # T: seq_len
     # N: num_heads
     # K: num_kv_heads
@@ -581,7 +583,7 @@ def attention(
     # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
     shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
 
-    backend_result = (attention_backend or AttentionBackend()).attention(
+    backend_result = attention_backend.attention(
         kv_cache,
         q,
         k,

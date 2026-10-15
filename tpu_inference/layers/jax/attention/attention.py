@@ -26,6 +26,8 @@ from jax.sharding import PartitionSpec as P
 from tpu_inference import utils
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
     ragged_paged_attention
+from tpu_inference.layers.common.attention_backend import \
+    require_rpa_attention_backend
 from tpu_inference.layers.common.attention_interface import \
     rpa_block_size_kwargs
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
@@ -83,6 +85,7 @@ class Attention(nnx.Module):
 
     def __post_init__(self, rngs: nnx.Rngs):
         """Initializes the weight kernels for Q, K, V, and O projections."""
+        require_rpa_attention_backend(type(self).__name__)
         N = self.num_attention_heads
         K = self.num_key_value_heads
         D = self.hidden_size

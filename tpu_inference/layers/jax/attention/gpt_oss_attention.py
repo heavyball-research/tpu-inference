@@ -25,6 +25,8 @@ from jax.sharding import PartitionSpec as P
 from tpu_inference import utils
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
     ragged_paged_attention_hd64
+from tpu_inference.layers.common.attention_backend import \
+    require_rpa_attention_backend
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.jax.base import create_param
@@ -73,6 +75,7 @@ class GptOssAttention(nnx.Module):
 
     def __post_init__(self, rngs: nnx.Rngs):
         """Initializes weights, biases, and RoPE module."""
+        require_rpa_attention_backend(type(self).__name__)
 
         self.sm_scale = 1.0 / (self.head_dim**0.5)
 
