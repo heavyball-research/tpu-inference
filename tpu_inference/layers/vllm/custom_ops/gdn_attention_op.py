@@ -25,7 +25,9 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
 
 from tpu_inference.layers.common.attention_backend import (
     attention_backend_name, create_linear_attention_backend)
-from tpu_inference.layers.common.gdn_attention import run_jax_gdn_attention
+from tpu_inference.layers.common.flywheel_gdn_replay import gdn_replay_window
+from tpu_inference.layers.common.gdn_attention import (
+    run_jax_gdn_attention, run_jax_gdn_replay_attention)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.utils import (
     reorder_concatenated_tensor_for_sharding, truncate_sharded_tensor)
@@ -106,7 +108,12 @@ def gdn_attention_core_tpu(
         j_conv_weight, [key_dim, key_dim, value_dim], tp_size, 0)
 
     layer_idx = vllm_context.layer_name_to_kvcache_index[layer_name]
-    conv_state, recurrent_state = vllm_context.kv_caches[layer_idx]
+    replay_window = layer_module.replay_window
+    if replay_window is None:
+        conv_state, recurrent_state = vllm_context.kv_caches[layer_idx]
+    else:
+        (conv_state, recurrent_state, recurrent_shadow,
+         replay_state) = vllm_context.kv_caches[layer_idx]
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
         conv_state_in = conv_state[:, :kernel_size - 1, :]
@@ -173,30 +180,69 @@ def gdn_attention_core_tpu(
         read_state_indices_sliced = state_indices_sliced
 
     linear_attention_backend = layer_module.linear_attention_backend
-    (new_conv_state_extracted,
-     new_recurrent_state), j_output = run_jax_gdn_attention(
-         j_mixed_qkv,
-         j_b,
-         j_a,
-         conv_state_in,
-         recurrent_state,
-         j_conv_weight,
-         j_conv_bias,
-         j_A_log,
-         j_dt_bias,
-         state_indices_sliced,
-         query_start_loc_sliced,
-         request_distribution,
-         seq_lens_sliced,
-         n_kq,
-         n_v,
-         d_k,
-         d_v,
-         kernel_size,
-         mesh=mesh,
-         read_state_indices=read_state_indices_sliced,
-         conv1d_gdn_kernel=linear_attention_backend.conv1d_gdn_kernel(),
-     )
+    if replay_window is None:
+        (new_conv_state_extracted,
+         new_recurrent_state), j_output = run_jax_gdn_attention(
+             j_mixed_qkv,
+             j_b,
+             j_a,
+             conv_state_in,
+             recurrent_state,
+             j_conv_weight,
+             j_conv_bias,
+             j_A_log,
+             j_dt_bias,
+             state_indices_sliced,
+             query_start_loc_sliced,
+             request_distribution,
+             seq_lens_sliced,
+             n_kq,
+             n_v,
+             d_k,
+             d_v,
+             kernel_size,
+             mesh=mesh,
+             read_state_indices=read_state_indices_sliced,
+             conv1d_gdn_kernel=linear_attention_backend.conv1d_gdn_kernel(),
+         )
+        new_extra_states = ()
+    else:
+        # Note: the runner ships each request's committed records
+        # (InputBatch.mamba_replay_lens_cpu) whenever replay is on, laid out
+        # per DP rank like mamba_state_indices.
+        assert attn_metadata.mamba_replay_lens is not None, (
+            "ReplaySSM decode needs AttentionMetadata.mamba_replay_lens.")
+        replay_lens_sliced = truncate_sharded_tensor(
+            attn_metadata.mamba_replay_lens, padded_num_reqs_per_dp, dp_size)
+        (new_conv_state_extracted, new_recurrent_state, new_recurrent_shadow,
+         new_replay_state), j_output = run_jax_gdn_replay_attention(
+             j_mixed_qkv,
+             j_b,
+             j_a,
+             conv_state_in,
+             recurrent_state,
+             recurrent_shadow,
+             replay_state,
+             j_conv_weight,
+             j_conv_bias,
+             j_A_log,
+             j_dt_bias,
+             state_indices_sliced,
+             query_start_loc_sliced,
+             request_distribution,
+             seq_lens_sliced,
+             replay_lens_sliced,
+             n_kq,
+             n_v,
+             d_k,
+             d_v,
+             kernel_size,
+             mesh=mesh,
+             replay_window=replay_window,
+             conv1d_gdn_replay_kernel=(
+                 linear_attention_backend.conv1d_gdn_replay_kernel()),
+         )
+        new_extra_states = (new_recurrent_shadow, new_replay_state)
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]
         new_conv_state = jnp.concatenate(
@@ -204,7 +250,8 @@ def gdn_attention_core_tpu(
     else:
         new_conv_state = new_conv_state_extracted
 
-    vllm_context.kv_caches[layer_idx] = (new_conv_state, new_recurrent_state)
+    vllm_context.kv_caches[layer_idx] = (new_conv_state, new_recurrent_state,
+                                         *new_extra_states)
 
     j_output_flat = j_output.reshape(core_attn_out.shape)
     core_attn_out.copy_(torch_view(j_output_flat))
@@ -219,6 +266,41 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # kernel gdn_attention_core_tpu runs.
         self.linear_attention_backend = create_linear_attention_backend(
             attention_backend_name(vllm_config))
+        # The ReplaySSM window of the decode, or None when replay is off.
+        self.replay_window = gdn_replay_window(vllm_config)
+        if self.replay_window is not None:
+            # Note: the kernel runs inside shard_map on each ATTN_HEAD
+            # shard's heads, the same split gdn_attention_core_tpu uses.
+            self.replay_tp_size = get_mesh_shape_product(
+                vllm_config.quant_config.mesh, ShardingAxisName.ATTN_HEAD)
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        """vLLM's (conv, recurrent) state shapes. With replay on, also the
+        recurrent state's bf16 shadow and the replay records,
+        (replay_window, tp * record_dim): one record layout of a shard's heads
+        per ATTN_HEAD shard, which kv_cache_manager shards on the last axis.
+
+        Note: vLLM runs these layers at tensor parallel size 1, so every shape
+        is global and kv_cache_manager shards it over the mesh."""
+        conv_shape, recurrent_shape = super().get_state_shape()
+        if self.replay_window is None:
+            return conv_shape, recurrent_shape
+        tp_size = self.replay_tp_size
+        record_dim = self.linear_attention_backend.replay_record_dim(
+            self.num_k_heads // tp_size, self.num_v_heads // tp_size,
+            self.head_k_dim, self.head_v_dim)
+        return (conv_shape, recurrent_shape, recurrent_shape,
+                (self.replay_window, tp_size * record_dim))
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        """vLLM's (conv, recurrent) state dtypes. With replay on, the
+        recurrent state is the f32 checkpoint
+        (FlywheelAttentionBackend.check_config sets mamba_ssm_cache_dtype),
+        followed by its bf16 shadow and the f32 records."""
+        conv_dtype, recurrent_dtype = super().get_state_dtype()
+        if self.replay_window is None:
+            return conv_dtype, recurrent_dtype
+        return conv_dtype, recurrent_dtype, torch.bfloat16, torch.float32
 
     def forward(
         self,

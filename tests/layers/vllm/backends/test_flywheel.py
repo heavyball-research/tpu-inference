@@ -79,7 +79,8 @@ def make_vllm_config(
         attention_config=AttentionConfig(
             backend=flywheel.FLYWHEEL_BACKEND_NAME),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(
-            architectures=[architecture])))
+            architectures=[architecture])),
+        additional_config={})
 
 
 def test_the_gdn_layers_run_flywheel(monkeypatch):

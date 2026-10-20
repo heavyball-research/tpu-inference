@@ -98,7 +98,8 @@ def mesh() -> Mesh:
 
 
 def make_vllm_config(backend: str | None):
-    return SimpleNamespace(attention_config=AttentionConfig(backend=backend))
+    return SimpleNamespace(attention_config=AttentionConfig(backend=backend),
+                           additional_config={})
 
 
 def make_gdn_inputs(mesh: Mesh) -> dict[str, object]:

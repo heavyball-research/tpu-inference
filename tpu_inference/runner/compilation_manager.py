@@ -490,6 +490,17 @@ class CompilationManager:
                                                sharding=metadata_attn_sharding)
         else:
             mamba_state_indices = None
+        # ReplaySSM's committed records, shaped and sharded like
+        # mamba_state_indices as `_prepare_inputs` ships them; None when
+        # replay is off.
+        if (mamba_state_indices is not None
+                and self.runner.gdn_replay_window is not None):
+            mamba_replay_lens = device_array(self.runner.mesh,
+                                             np.zeros(self.runner.max_num_reqs,
+                                                      dtype=np.int32),
+                                             sharding=metadata_attn_sharding)
+        else:
+            mamba_replay_lens = None
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
@@ -511,6 +522,7 @@ class CompilationManager:
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
+                mamba_replay_lens=mamba_replay_lens,
                 padded_num_reqs=num_reqs,
                 pcp=pcp,
                 backend_metadata=attention_backend.backend_metadata(

@@ -15,6 +15,7 @@
 from typing import Dict
 
 import jax
+import numpy as np
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from tpu_inference.logger import init_logger
@@ -51,21 +52,25 @@ class PersistentBatchManager:
             return swap_cnt
         max_decode_tokens = self.input_batch.max_decode_tokens
 
+        def is_decode(req_index: int) -> bool:
+            req_id = self.input_batch.req_ids[req_index]
+            return bool(
+                self.input_batch.is_decode(
+                    req_index, scheduler_output.num_scheduled_tokens[req_id]))
+
+        # Note: every scheduled request has a token, so a step of num_reqs
+        # tokens schedules exactly one for each.
         if (max_decode_tokens == 1
-                and scheduler_output.total_num_scheduled_tokens == num_reqs):
+                and scheduler_output.total_num_scheduled_tokens == num_reqs and
+                np.all(self.input_batch.is_decode(np.arange(num_reqs), 1))):
             num_decode = num_reqs
             self.input_batch.request_distribution = [
                 num_decode, num_decode, num_reqs
             ]
             return swap_cnt
 
-        # Check if all scheduled requests match the decode threshold
-        all_decode = True
-        for req_id in self.input_batch.req_ids[:num_reqs]:
-            if scheduler_output.num_scheduled_tokens[
-                    req_id] > max_decode_tokens:
-                all_decode = False
-                break
+        # Check if all scheduled requests are decodes
+        all_decode = all(is_decode(i) for i in range(num_reqs))
 
         if all_decode:
             num_decode = num_reqs
@@ -77,15 +82,10 @@ class PersistentBatchManager:
         # Use two-pointer approach to reorder the decode requests to front.
         i, j = 0, num_reqs - 1
         while i < j:
-            i_req_id = self.input_batch.req_ids[i]
-            j_req_id = self.input_batch.req_ids[j]
-
-            if scheduler_output.num_scheduled_tokens[
-                    i_req_id] <= max_decode_tokens:
+            if is_decode(i):
                 # i is a decode request, move to the next one.
                 i += 1
-            elif scheduler_output.num_scheduled_tokens[
-                    j_req_id] > max_decode_tokens:
+            elif not is_decode(j):
                 # j is a prefill request, move to the previous one.
                 j -= 1
             else:
@@ -95,8 +95,7 @@ class PersistentBatchManager:
                 j -= 1
                 swap_cnt += 1
 
-        num_decode = i + int(scheduler_output.num_scheduled_tokens[
-            self.input_batch.req_ids[i]] <= max_decode_tokens)
+        num_decode = i + int(is_decode(i))
 
         self.input_batch.request_distribution = [
             num_decode, num_decode, num_reqs
@@ -195,6 +194,11 @@ class PersistentBatchManager:
                 else:
                     self.requests[req_id].mamba_state_slot = int(
                         self.input_batch.mamba_state_indices_cpu[req_index])
+                    # Note: under ReplaySSM the kept slot holds a
+                    # checkpoint plus these records, which the request
+                    # resumes from when it is added back.
+                    self.requests[req_id].mamba_replay_len = int(
+                        self.input_batch.mamba_replay_lens_cpu[req_index])
             req_index = self.input_batch.remove_request(
                 req_id, free_mamba_slot=reset_mamba_slot)
             assert req_index is not None

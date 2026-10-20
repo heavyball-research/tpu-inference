@@ -269,6 +269,7 @@ class TestVllmGatedDeltaNetAttention:
 
         # Layer mock
         layer_module = MagicMock()
+        layer_module.replay_window = None
         layer_module.num_k_heads = n_kq
         layer_module.num_v_heads = n_v
         layer_module.head_k_dim = d_k
@@ -381,6 +382,7 @@ class TestVllmGatedDeltaNetAttention:
 
         # Layer mock (mamba_cache_mode is none)
         layer_module = MagicMock()
+        layer_module.replay_window = None
         layer_module.num_k_heads = n_kq
         layer_module.num_v_heads = n_v
         layer_module.head_k_dim = d_k

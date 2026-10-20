@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ import pytest
 from jax.sharding import Mesh
 
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.runner.input_batch import InputBatch
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
@@ -45,6 +47,9 @@ class TestTPUJaxRunnerDPInputsLightweight:
         self.runner.input_batch = MagicMock()
         self.runner.input_batch.max_decode_tokens = 1
         self.runner.input_batch.max_decode_tokens = 1
+        self.runner.input_batch.gdn_replay = False
+        self.runner.input_batch.is_decode = functools.partial(
+            InputBatch.is_decode, self.runner.input_batch)
         self.runner.input_batch.num_reqs = 2
         self.runner.input_batch.req_ids = ["req1", "req2", "req3", "req4"]
         self.runner.input_batch.req_id_to_index = {

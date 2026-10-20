@@ -16,7 +16,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 
 """
 import functools
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,10 @@ from tpu_inference.layers.common.attention_backend import (
     Conv1dGDNKernel, GDNLinearAttentionBackend)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
+
+if TYPE_CHECKING:
+    from tpu_inference.layers.common.flywheel_linear_attention import \
+        Conv1dGDNReplayKernel
 
 
 def run_jax_gdn_attention(
@@ -173,3 +177,123 @@ def run_jax_gdn_attention(
     (new_conv_state, new_recurrent_state), output = mapped_fn(*mapped_args)
 
     return (new_conv_state, new_recurrent_state), output
+
+
+def run_jax_gdn_replay_attention(
+    j_mixed_qkv: jnp.ndarray,
+    j_b: jnp.ndarray,
+    j_a: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    recurrent_shadow: jnp.ndarray,
+    replay_state: jnp.ndarray,
+    j_conv_weight: jnp.ndarray,
+    j_conv_bias: Optional[jnp.ndarray],
+    j_A_log: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    replay_lens: jnp.ndarray,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    mesh: jax.sharding.Mesh,
+    *,
+    replay_window: int,
+    conv1d_gdn_replay_kernel: "Conv1dGDNReplayKernel",
+) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+           jnp.ndarray]:
+    """run_jax_gdn_attention with ReplaySSM decode (flywheel_tpu's
+    fused_conv1d_gdn_replay), shard-mapped the same way. Each request reads
+    and writes its state_indices slot.
+
+    Args:
+        recurrent_state: The f32 checkpoints, `(num_blocks, n_v, d_k, d_v)`.
+        recurrent_shadow: Their bf16 shadow, sharded like recurrent_state.
+        replay_state: f32 records `(num_blocks, replay_window, tp *
+          record_dim)`, one record layout of the shard's heads per
+          ATTN_HEAD shard of size tp.
+        replay_lens: `(max_reqs,)` int32, the records each request has
+          committed.
+        replay_window: The records a request keeps before it flushes.
+        conv1d_gdn_replay_kernel: FlywheelLinearAttentionBackend's
+          conv1d_gdn_replay_kernel.
+        The other arguments are those of run_jax_gdn_attention.
+
+    Returns:
+        ((new_conv_state, new_recurrent_state, new_recurrent_shadow,
+        new_replay_state), output), with output `(num_tokens, n_v * d_v)`.
+    """
+    recurrent_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+                       None, None)
+    conv_spec = P(ShardingAxisName.ATTN_DATA, None, ShardingAxisName.ATTN_HEAD)
+    records_spec = P(ShardingAxisName.ATTN_DATA, None,
+                     ShardingAxisName.ATTN_HEAD)
+    in_specs = (
+        P(ShardingAxisName.ATTN_DATA,
+          ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
+        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
+        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
+        conv_spec,  # conv_state
+        recurrent_spec,  # recurrent_state
+        recurrent_spec,  # recurrent_shadow
+        records_spec,  # replay_state
+        P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
+        P(ShardingAxisName.ATTN_HEAD)
+        if j_conv_bias is not None else None,  # j_conv_bias
+        P(ShardingAxisName.ATTN_HEAD),  # j_A_log
+        P(ShardingAxisName.ATTN_HEAD),  # j_dt_bias
+        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
+        P(ShardingAxisName.ATTN_DATA),  # state_indices
+        P(ShardingAxisName.ATTN_DATA),  # distribution
+        P(ShardingAxisName.ATTN_DATA),  # seq_lens
+        P(ShardingAxisName.ATTN_DATA),  # read_state_indices
+        P(ShardingAxisName.ATTN_DATA),  # replay_lens
+    )
+    out_specs = (
+        (conv_spec, recurrent_spec, recurrent_spec, records_spec),
+        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # output
+    )
+
+    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    local_kernel = functools.partial(
+        conv1d_gdn_replay_kernel,
+        n_kq=n_kq // tp_size,
+        n_v=n_v // tp_size,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        replay_window=replay_window,
+    )
+    mapped_fn = jax.shard_map(
+        local_kernel,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )
+    # Note: mamba_cache_mode "none" only, so every request reads its
+    # initial state from the slot it writes.
+    return mapped_fn(
+        j_mixed_qkv,
+        j_b,
+        j_a,
+        conv_state,
+        recurrent_state,
+        recurrent_shadow,
+        replay_state,
+        j_conv_weight,
+        j_conv_bias,
+        j_A_log,
+        j_dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        seq_lens,
+        state_indices,
+        replay_lens,
+    )
