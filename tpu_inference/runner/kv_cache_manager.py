@@ -958,8 +958,8 @@ class KVCacheManager:
             num_blocks = slot_num_blocks[slot_key]
 
             if isinstance(layer_spec, MambaSpec):
-                # ReplaySSM: a GDN layer also keeps its recurrent state's
-                # bf16 shadow and its records (VllmGatedDeltaNetAttention).
+                # ReplaySSM: a GDN layer also keeps its records and their
+                # gates (VllmGatedDeltaNetAttention).
                 is_gdn_replay = self.runner.gdn_replay_window is not None
                 if is_gdn_replay and (layer_spec.mamba_type
                                       != MambaAttentionBackendEnum.GDN_ATTN
@@ -977,16 +977,14 @@ class KVCacheManager:
                         # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
                                              ShardingAxisName.ATTN_HEAD)
-                    elif state_index == 1 or (is_gdn_replay
-                                              and state_index == 2):
+                    elif state_index == 1:
                         # ssm_state: [num_blocks, num_heads, head_dim, state_size]
-                        # (and its replay shadow)
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                              ShardingAxisName.ATTN_HEAD, None,
                                              None)
-                    elif is_gdn_replay and state_index == 3:
-                        # replay records: [num_blocks, replay_window,
-                        # tp * record_dim], one record layout per head shard
+                    elif is_gdn_replay and state_index in (2, 3):
+                        # replay records and gates: [num_blocks,
+                        # replay_window, tp * dim], one layout per head shard
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
                                              ShardingAxisName.ATTN_HEAD)
                     else:

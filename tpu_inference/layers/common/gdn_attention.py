@@ -185,8 +185,8 @@ def run_jax_gdn_replay_attention(
     j_a: jnp.ndarray,
     conv_state: jnp.ndarray,
     recurrent_state: jnp.ndarray,
-    recurrent_shadow: jnp.ndarray,
     replay_state: jnp.ndarray,
+    replay_gates: jnp.ndarray,
     j_conv_weight: jnp.ndarray,
     j_conv_bias: Optional[jnp.ndarray],
     j_A_log: jnp.ndarray,
@@ -213,10 +213,11 @@ def run_jax_gdn_replay_attention(
 
     Args:
         recurrent_state: The f32 checkpoints, `(num_blocks, n_v, d_k, d_v)`.
-        recurrent_shadow: Their bf16 shadow, sharded like recurrent_state.
-        replay_state: f32 records `(num_blocks, replay_window, tp *
+        replay_state: bf16 records [u | k] `(num_blocks, replay_window, tp *
           record_dim)`, one record layout of the shard's heads per
           ATTN_HEAD shard of size tp.
+        replay_gates: The records' f32 log decays `(num_blocks,
+          replay_window, tp * gate_dim)`, laid out like replay_state.
         replay_lens: `(max_reqs,)` int32, the records each request has
           committed.
         replay_window: The records a request keeps before it flushes.
@@ -225,8 +226,8 @@ def run_jax_gdn_replay_attention(
         The other arguments are those of run_jax_gdn_attention.
 
     Returns:
-        ((new_conv_state, new_recurrent_state, new_recurrent_shadow,
-        new_replay_state), output), with output `(num_tokens, n_v * d_v)`.
+        ((new_conv_state, new_recurrent_state, new_replay_state,
+        new_replay_gates), output), with output `(num_tokens, n_v * d_v)`.
     """
     recurrent_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
                        None, None)
@@ -240,8 +241,8 @@ def run_jax_gdn_replay_attention(
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
         conv_spec,  # conv_state
         recurrent_spec,  # recurrent_state
-        recurrent_spec,  # recurrent_shadow
         records_spec,  # replay_state
+        records_spec,  # replay_gates
         P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
         P(ShardingAxisName.ATTN_HEAD)
         if j_conv_bias is not None else None,  # j_conv_bias
@@ -255,7 +256,7 @@ def run_jax_gdn_replay_attention(
         P(ShardingAxisName.ATTN_DATA),  # replay_lens
     )
     out_specs = (
-        (conv_spec, recurrent_spec, recurrent_spec, records_spec),
+        (conv_spec, recurrent_spec, records_spec, records_spec),
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # output
     )
 
@@ -284,8 +285,8 @@ def run_jax_gdn_replay_attention(
         j_a,
         conv_state,
         recurrent_state,
-        recurrent_shadow,
         replay_state,
+        replay_gates,
         j_conv_weight,
         j_conv_bias,
         j_A_log,
