@@ -23,7 +23,8 @@ from tpu_inference.layers.common.attention_backend import (
     Conv1dGDNKernel, LinearAttentionBackend)
 
 # flywheel_tpu's fused_conv1d_gdn_replay. It returns ((new_conv_state,
-# new_recurrent_state, new_replay_state, new_replay_gates), output).
+# new_recurrent_state, new_replay_state, new_replay_gates), output), the
+# recurrent state as its int32 hi and lo planes.
 Conv1dGDNReplayKernel = Callable[..., tuple[tuple[jax.Array, jax.Array,
                                                   jax.Array, jax.Array],
                                             jax.Array]]
@@ -52,3 +53,10 @@ class FlywheelLinearAttentionBackend(LinearAttentionBackend):
         """The last axis of the records' f32 log decays (the replay gates), for
         the heads one kernel call sees."""
         return gdn_wrapper.replay_gate_dim(n_kq, n_v, d_k, d_v)
+
+    def replay_checkpoint_shape(self, n_kq: int, n_v: int, d_k: int,
+                                d_v: int) -> tuple[int, ...]:
+        """The per-slot shape of the int32 replay checkpoint, the hi and lo
+        planes of the f32 recurrent state of n_v value heads, (2, n_v,
+        d_k // 2, d_v)."""
+        return gdn_wrapper.replay_checkpoint_shape(n_kq, n_v, d_k, d_v)

@@ -275,10 +275,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 vllm_config.quant_config.mesh, ShardingAxisName.ATTN_HEAD)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
-        """vLLM's (conv, recurrent) state shapes. With replay on, also the
-        replay records [u | k], (replay_window, tp * record_dim), and their
-        gates, (replay_window, tp * gate_dim): one layout of a shard's heads
-        per ATTN_HEAD shard, which kv_cache_manager shards on the last axis.
+        """vLLM's (conv, recurrent) state shapes. With replay on, the
+        recurrent state is the checkpoint's hi and lo planes, (2, n_v,
+        d_k // 2, d_v), followed by the replay records [u | k],
+        (replay_window, tp * record_dim), and their gates, (replay_window,
+        tp * gate_dim): one layout of a shard's heads per ATTN_HEAD shard,
+        which kv_cache_manager shards on the last axis.
 
         Note: vLLM runs these layers at tensor parallel size 1, so every shape
         is global and kv_cache_manager shards it over the mesh."""
@@ -291,19 +293,22 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         record_dim = self.linear_attention_backend.replay_record_dim(
             *local_dims)
         gate_dim = self.linear_attention_backend.replay_gate_dim(*local_dims)
-        return (conv_shape, recurrent_shape, (self.replay_window,
-                                              tp_size * record_dim),
+        checkpoint_shape = self.linear_attention_backend.replay_checkpoint_shape(
+            self.num_k_heads, self.num_v_heads, self.head_k_dim,
+            self.head_v_dim)
+        return (conv_shape, checkpoint_shape, (self.replay_window,
+                                               tp_size * record_dim),
                 (self.replay_window, tp_size * gate_dim))
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         """vLLM's (conv, recurrent) state dtypes. With replay on, the
-        recurrent state is the f32 checkpoint
-        (FlywheelAttentionBackend.check_config sets mamba_ssm_cache_dtype),
-        followed by the bf16 records and their f32 gates."""
+        recurrent state is the f32 checkpoint as int32 hi and lo planes
+        (FlywheelAttentionBackend.check_config sets mamba_ssm_cache_dtype to
+        float32 for it), followed by the bf16 records and their f32 gates."""
         conv_dtype, recurrent_dtype = super().get_state_dtype()
         if self.replay_window is None:
             return conv_dtype, recurrent_dtype
-        return conv_dtype, recurrent_dtype, torch.bfloat16, torch.float32
+        return conv_dtype, torch.int32, torch.bfloat16, torch.float32
 
     def forward(
         self,

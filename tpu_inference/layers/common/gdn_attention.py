@@ -212,7 +212,8 @@ def run_jax_gdn_replay_attention(
     and writes its state_indices slot.
 
     Args:
-        recurrent_state: The f32 checkpoints, `(num_blocks, n_v, d_k, d_v)`.
+        recurrent_state: The f32 checkpoints as int32 hi and lo planes,
+          `(num_blocks, 2, n_v, d_k // 2, d_v)`.
         replay_state: bf16 records [u | k] `(num_blocks, replay_window, tp *
           record_dim)`, one record layout of the shard's heads per
           ATTN_HEAD shard of size tp.
@@ -229,8 +230,8 @@ def run_jax_gdn_replay_attention(
         ((new_conv_state, new_recurrent_state, new_replay_state,
         new_replay_gates), output), with output `(num_tokens, n_v * d_v)`.
     """
-    recurrent_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-                       None, None)
+    recurrent_spec = P(ShardingAxisName.ATTN_DATA, None,
+                       ShardingAxisName.ATTN_HEAD, None, None)
     conv_spec = P(ShardingAxisName.ATTN_DATA, None, ShardingAxisName.ATTN_HEAD)
     records_spec = P(ShardingAxisName.ATTN_DATA, None,
                      ShardingAxisName.ATTN_HEAD)
