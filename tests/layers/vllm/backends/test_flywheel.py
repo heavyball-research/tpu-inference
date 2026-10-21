@@ -39,7 +39,6 @@ FLYWHEEL_VLLM_BACKEND = f"{flywheel.__name__}.FlywheelPallasAttentionBackend"
 @pytest.fixture(autouse=True)
 def registered(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(attention_backend, "_REGISTERED_BACKENDS", {})
-    monkeypatch.setattr(attention_backend, "ATTENTION_BACKENDS", {})
     register_layers()
 
 
@@ -55,13 +54,9 @@ def test_the_plugin_lets_vllm_parse_the_name():
 
 
 def test_the_name_selects_the_flywheel_backends():
-    backend = attention_backend.create_attention_backend(
-        flywheel.FLYWHEEL_BACKEND_NAME)
-    assert isinstance(backend, FlywheelAttentionBackend)
-    # Note: the vLLM layers look the backend up by name and must get the
-    # instance the runner configured.
-    assert attention_backend.create_attention_backend(
-        flywheel.FLYWHEEL_BACKEND_NAME) is backend
+    assert isinstance(
+        attention_backend.create_attention_backend(
+            flywheel.FLYWHEEL_BACKEND_NAME), FlywheelAttentionBackend)
     assert isinstance(
         attention_backend.create_linear_attention_backend(
             flywheel.FLYWHEEL_BACKEND_NAME), FlywheelLinearAttentionBackend)

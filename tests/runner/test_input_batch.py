@@ -662,27 +662,6 @@ def dp_spec_input_batch():
     )
 
 
-@pytest.mark.parametrize(("backend_max_decode_tokens", "max_decode_tokens"),
-                         [(1, 1), (SLOT_STRIDE, SLOT_STRIDE)])
-def test_decode_segment_follows_the_attention_backend(
-        backend_max_decode_tokens, max_decode_tokens):
-    # Note: a backend whose decode kernel attends verify windows takes up
-    # to num_speculative_tokens + 1 tokens per decode request.
-    input_batch = InputBatch(
-        max_num_reqs=MAX_NUM_REQS,
-        max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        pin_memory=False,
-        vocab_size=VOCAB_SIZE,
-        block_sizes=BLOCK_SIZES,
-        is_spec_decode=True,
-        num_speculative_tokens=NUM_SPEC_TOKENS,
-        backend_max_decode_tokens=backend_max_decode_tokens,
-    )
-
-    assert input_batch.max_decode_tokens == max_decode_tokens
-
-
 def test_mamba_slot_stride_one_matches_legacy(input_batch: InputBatch):
     """Without spec decode the stride is 1 and the pool is the legacy
     layout: every slot in (0, local_slots) is a valid base."""

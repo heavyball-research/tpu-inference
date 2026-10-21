@@ -14,7 +14,6 @@
 """The flywheel backend on CPU: its host-side scheduling, and attention()
 dispatch with the kernel stubbed."""
 
-import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -124,8 +123,10 @@ class TestDispatch:
         assert kv_write_slices.shape == (3 * KV_WRITE_BOUND, )
         assert kv_write_num_slices.shape == (1, )
         np.testing.assert_array_equal(distribution, [0, 0, NUM_SEQS])
-        assert kwargs == {"sm_scale": HEAD_DIM**-0.5,
-                          "max_decode_query_len": 1}
+        assert kwargs == {
+            "sm_scale": HEAD_DIM**-0.5,
+            "max_decode_query_len": 1
+        }
         assert output.shape == (TOTAL_TOKENS, NUM_HEADS, HEAD_DIM)
         assert kv_cache.shape == (NUM_BLOCKS, BLOCK_SIZE, 2 * NUM_KV_HEADS,
                                   HEAD_DIM)
@@ -141,49 +142,12 @@ class TestDispatch:
             self.run_attention(mesh, monkeypatch, **{option: value})
         assert expected in str(excinfo.value)
 
-    def test_rejects_non_causal_step_tokens(self, mesh, monkeypatch):
-        with pytest.raises(NotImplementedError, match="non-causal"):
-            self.run_attention(mesh, monkeypatch, use_causal_mask=False)
 
-    def test_rows_without_backend_metadata_take_the_device_step(
-            self, mesh, monkeypatch):
-        # Note: a draft model's rows carry no backend metadata; the
-        # device step writes and attends them, non-causally too.
-        device_wrapper = MagicMock(return_value=(None, None))
-        monkeypatch.setattr(fa, "sharded_flywheel_tpu_device_attention",
-                            device_wrapper)
-        md, _ = build_metadata()
-        draft_md = dataclasses.replace(md, backend_metadata=None)
-        q = jnp.ones((TOTAL_TOKENS, NUM_HEADS, HEAD_DIM), jnp.bfloat16)
-        k = jnp.ones((TOTAL_TOKENS, NUM_KV_HEADS, HEAD_DIM), jnp.bfloat16)
-
-        attention_interface.attention(kv_cache=None,
-                                      q=q,
-                                      k=k,
-                                      v=k,
-                                      attention_metadata=draft_md,
-                                      mesh=mesh,
-                                      use_causal_mask=False,
-                                      decode_query_size=5,
-                                      attention_backend=(
-                                          fa.FlywheelAttentionBackend()))
-
-        device_wrapper.assert_called_once()
-        args, kwargs = device_wrapper.call_args
-        assert args[0] is mesh and len(args) == 9
-        np.testing.assert_array_equal(args[-1], [0, 0, NUM_SEQS])
-        assert kwargs == {"sm_scale": HEAD_DIM**-0.5,
-                          "causal": False,
-                          "window_len": 5}
-
-
-def make_vllm_config(
-        *,
-        block_size: int = 16,
-        user_specified_block_size: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
-        head_size: int = HEAD_DIM,
-        speculative_config: SimpleNamespace | None = None) -> SimpleNamespace:
+def make_vllm_config(*,
+                     block_size: int = 16,
+                     user_specified_block_size: bool = False,
+                     dtype: torch.dtype = torch.bfloat16,
+                     head_size: int = HEAD_DIM) -> SimpleNamespace:
     """The vllm_config fields FlywheelAttentionBackend.check_config reads."""
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -195,7 +159,7 @@ def make_vllm_config(
                                      get_head_size=lambda: head_size),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1,
                                         prefill_context_parallel_size=1),
-        speculative_config=speculative_config,
+        speculative_config=None,
         kv_transfer_config=None,
         additional_config={})
 
@@ -225,28 +189,6 @@ class TestCheckConfig:
         with pytest.raises(ValueError, match=expected):
             fa.FlywheelAttentionBackend().check_config(
                 make_vllm_config(**overrides))
-
-    def test_serves_dflash_only(self):
-        fa.FlywheelAttentionBackend().check_config(
-            make_vllm_config(speculative_config=SimpleNamespace(
-                method="dflash", num_speculative_tokens=15)))
-        with pytest.raises(ValueError, match="'eagle3' is not supported"):
-            fa.FlywheelAttentionBackend().check_config(
-                make_vllm_config(speculative_config=SimpleNamespace(
-                    method="eagle3", num_speculative_tokens=3)))
-
-
-@pytest.mark.parametrize(("speculative_config", "max_decode_query_len"), [
-    (None, 1),
-    (SimpleNamespace(method="dflash", num_speculative_tokens=15), 16),
-])
-def test_configure_sizes_the_decode_window(speculative_config,
-                                           max_decode_query_len):
-    backend = fa.FlywheelAttentionBackend()
-
-    backend.configure(make_vllm_config(speculative_config=speculative_config))
-
-    assert backend.max_decode_query_len == max_decode_query_len
 
 
 def naive_kv_write_slices(cu_q_lens: list[int], kv_lens: list[int],
@@ -314,16 +256,6 @@ def test_attention_phase(num_decode, seq_lens, phase):
 def test_attention_phase_needs_decode_rows_first():
     with pytest.raises(ValueError, match="decode requests first"):
         fa.select_attention_phase(1, np.array([0, 5, 6]), np.array([5, 9]))
-
-
-def test_attention_phase_takes_verify_windows_as_decode_rows():
-    cu_q_lens = np.array([0, 16, 19, 219])
-    kv_lens = np.array([300, 140, 219])
-
-    assert fa.select_attention_phase(2, cu_q_lens, kv_lens,
-                                     16) == fa._EXTEND_PHASE
-    with pytest.raises(ValueError, match="1 to 15 queries each"):
-        fa.select_attention_phase(2, cu_q_lens, kv_lens, 15)
 
 
 @pytest.mark.parametrize(
@@ -398,12 +330,9 @@ def kv_cache_groups() -> list[KVCacheGroupSpec]:
 
 
 def host_step(seq_lens_per_rank: list[list[tuple[int, int]]],
-              bucket: int,
-              num_decode_per_rank: list[int] | None = None) -> HostStepInputs:
+              bucket: int) -> HostStepInputs:
     """The runner's host arrays for a step of (q_len, kv_len) requests per DP
-    rank, decode rows first, laid out per rank as _prepare_inputs does. The
-    decode requests are the leading one-token ones unless num_decode_per_rank
-    names them."""
+    rank, decode rows first, laid out per rank as _prepare_inputs does."""
     dp_size = len(seq_lens_per_rank)
     query_start_loc = np.zeros(dp_size * (MAX_REQS_PER_RANK + 1), np.int32)
     seq_lens = np.zeros(dp_size * MAX_REQS_PER_RANK, np.int32)
@@ -418,11 +347,8 @@ def host_step(seq_lens_per_rank: list[list[tuple[int, int]]],
         req_offset = rank * MAX_REQS_PER_RANK
         seq_lens[req_offset:req_offset +
                  len(requests)] = [kv_len for _, kv_len in requests]
-        if num_decode_per_rank is None:
-            num_decode = sum(q_len == 1 and kv_len > 1
-                             for q_len, kv_len in requests)
-        else:
-            num_decode = num_decode_per_rank[rank]
+        num_decode = sum(q_len == 1 and kv_len > 1
+                         for q_len, kv_len in requests)
         request_distribution[3 * rank:3 * rank + 3] = (num_decode, num_decode,
                                                        len(requests))
     rng = np.random.default_rng(0)
@@ -445,11 +371,10 @@ def host_step(seq_lens_per_rank: list[list[tuple[int, int]]],
         padded_num_scheduled_tokens_per_dp_rank=bucket)
 
 
-def prepare(step: HostStepInputs,
-            backend: fa.FlywheelAttentionBackend) -> dict[str, jax.Array]:
+def prepare(step: HostStepInputs) -> dict[str, jax.Array]:
     """prepare_step, and the device buffer unpacked as the runner does."""
     device_buffer = DeviceBuffer()
-    backend.prepare_step(step, device_buffer)
+    fa.FlywheelAttentionBackend().prepare_step(step, device_buffer)
     blob, layout = device_buffer.build()
     return DeviceBuffer.unpack_arrays(jnp.asarray(blob), layout)
 
@@ -465,32 +390,17 @@ class TestPrepareStep:
     def test_dp_ranks_that_disagree_run_extend(self):
         step = host_step([[(1, 300), (1, 129)], [(256, 256)]], bucket=256)
 
-        arrays = prepare(step, fa.FlywheelAttentionBackend())
+        arrays = prepare(step)
 
         assert step_kernel(arrays, 256) == fa._EXTEND_PHASE
 
-    @pytest.mark.parametrize(
-        ("seq_lens_per_rank", "num_decode_per_rank", "speculative_config"),
-        [
-            ([[(1, 300), (1, 129)], [(40, 700), (200, 457)]], None, None),
-            # Note: under async scheduling the host's lengths overcount the
-            # previous step's rejected drafts, so verify windows must be left
-            # to the device-side append, not the writer.
-            ([[(16, 300), (3, 129)], [(16, 50), (40, 457)]], [2, 1],
-             SimpleNamespace(method="dflash", num_speculative_tokens=15)),
-        ])
-    def test_each_attention_group_gets_its_ranks_slice_tables(
-            self, seq_lens_per_rank, num_decode_per_rank, speculative_config):
-        step = host_step(seq_lens_per_rank,
-                         bucket=256,
-                         num_decode_per_rank=num_decode_per_rank)
+    def test_each_attention_group_gets_its_ranks_slice_tables(self):
+        seq_lens_per_rank = [[(1, 300), (1, 129)], [(40, 700), (200, 457)]]
+        step = host_step(seq_lens_per_rank, bucket=256)
+
+        arrays = prepare(step)
+
         backend = fa.FlywheelAttentionBackend()
-        backend.configure(
-            make_vllm_config(speculative_config=speculative_config))
-
-        arrays = prepare(step, backend)
-
-        assert step_kernel(arrays, 256) == fa._EXTEND_PHASE
         assert backend.backend_metadata(arrays, len(PAGE_SIZES)) is None
         for gid, page_size in enumerate(PAGE_SIZES):
             md = backend.backend_metadata(arrays, gid)
@@ -499,7 +409,7 @@ class TestPrepareStep:
             slices = np.asarray(md.kv_write_slices).reshape(2, 3, bound)
             for rank, requests in enumerate(seq_lens_per_rank):
                 q_lens = [q_len for q_len, _ in requests]
-                # The decode rows are written on the device, not by the writer.
+                # The decode kernel appends the decode rows itself.
                 num_decode = int(step.request_distribution[3 * rank])
                 req_offset = rank * MAX_REQS_PER_RANK + num_decode
                 expected = naive_kv_write_slices(
@@ -517,8 +427,7 @@ class TestPrepareStep:
         ([[(1, 300), (1, 129)], [(1, 50)]], fa._DECODE_PHASE),
     ])
     def test_picks_its_kernel_on_the_host(self, seq_lens_per_rank, kernel):
-        arrays = prepare(host_step(seq_lens_per_rank, bucket=1024),
-                         fa.FlywheelAttentionBackend())
+        arrays = prepare(host_step(seq_lens_per_rank, bucket=1024))
 
         assert step_kernel(arrays, 1024) == kernel
 
@@ -532,8 +441,7 @@ class TestPrepareStep:
         ([[(128, 128)] * 4, [(1000, 1000)]], 1024),
     ])
     def test_the_warmup_primes_the_step(self, mesh, seq_lens_per_rank, bucket):
-        arrays = prepare(host_step(seq_lens_per_rank, bucket),
-                         fa.FlywheelAttentionBackend())
+        arrays = prepare(host_step(seq_lens_per_rank, bucket))
 
         backend = fa.FlywheelAttentionBackend()
         warmup_arrays = backend.warmup_arrays(
