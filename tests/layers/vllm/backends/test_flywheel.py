@@ -39,7 +39,7 @@ FLYWHEEL_VLLM_BACKEND = f"{flywheel.__name__}.FlywheelPallasAttentionBackend"
 @pytest.fixture(autouse=True)
 def registered(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(attention_backend, "_REGISTERED_BACKENDS", {})
-    monkeypatch.setattr(attention_backend, "_ATTENTION_BACKENDS", {})
+    monkeypatch.setattr(attention_backend, "ATTENTION_BACKENDS", {})
     register_layers()
 
 

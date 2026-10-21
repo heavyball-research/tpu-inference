@@ -445,14 +445,11 @@ def host_step(seq_lens_per_rank: list[list[tuple[int, int]]],
         padded_num_scheduled_tokens_per_dp_rank=bucket)
 
 
-def prepare(
-    step: HostStepInputs,
-    backend: fa.FlywheelAttentionBackend | None = None
-) -> dict[str, jax.Array]:
+def prepare(step: HostStepInputs,
+            backend: fa.FlywheelAttentionBackend) -> dict[str, jax.Array]:
     """prepare_step, and the device buffer unpacked as the runner does."""
     device_buffer = DeviceBuffer()
-    (backend or fa.FlywheelAttentionBackend()).prepare_step(
-        step, device_buffer)
+    backend.prepare_step(step, device_buffer)
     blob, layout = device_buffer.build()
     return DeviceBuffer.unpack_arrays(jnp.asarray(blob), layout)
 
@@ -468,17 +465,32 @@ class TestPrepareStep:
     def test_dp_ranks_that_disagree_run_extend(self):
         step = host_step([[(1, 300), (1, 129)], [(256, 256)]], bucket=256)
 
-        arrays = prepare(step)
+        arrays = prepare(step, fa.FlywheelAttentionBackend())
 
         assert step_kernel(arrays, 256) == fa._EXTEND_PHASE
 
-    def test_each_attention_group_gets_its_ranks_slice_tables(self):
-        seq_lens_per_rank = [[(1, 300), (1, 129)], [(40, 700), (200, 457)]]
-        step = host_step(seq_lens_per_rank, bucket=256)
-
-        arrays = prepare(step)
-
+    @pytest.mark.parametrize(
+        ("seq_lens_per_rank", "num_decode_per_rank", "speculative_config"),
+        [
+            ([[(1, 300), (1, 129)], [(40, 700), (200, 457)]], None, None),
+            # Note: under async scheduling the host's lengths overcount the
+            # previous step's rejected drafts, so verify windows must be left
+            # to the device-side append, not the writer.
+            ([[(16, 300), (3, 129)], [(16, 50), (40, 457)]], [2, 1],
+             SimpleNamespace(method="dflash", num_speculative_tokens=15)),
+        ])
+    def test_each_attention_group_gets_its_ranks_slice_tables(
+            self, seq_lens_per_rank, num_decode_per_rank, speculative_config):
+        step = host_step(seq_lens_per_rank,
+                         bucket=256,
+                         num_decode_per_rank=num_decode_per_rank)
         backend = fa.FlywheelAttentionBackend()
+        backend.configure(
+            make_vllm_config(speculative_config=speculative_config))
+
+        arrays = prepare(step, backend)
+
+        assert step_kernel(arrays, 256) == fa._EXTEND_PHASE
         assert backend.backend_metadata(arrays, len(PAGE_SIZES)) is None
         for gid, page_size in enumerate(PAGE_SIZES):
             md = backend.backend_metadata(arrays, gid)
@@ -487,7 +499,7 @@ class TestPrepareStep:
             slices = np.asarray(md.kv_write_slices).reshape(2, 3, bound)
             for rank, requests in enumerate(seq_lens_per_rank):
                 q_lens = [q_len for q_len, _ in requests]
-                # The decode kernel appends the decode rows itself.
+                # The decode rows are written on the device, not by the writer.
                 num_decode = int(step.request_distribution[3 * rank])
                 req_offset = rank * MAX_REQS_PER_RANK + num_decode
                 expected = naive_kv_write_slices(
@@ -499,44 +511,14 @@ class TestPrepareStep:
                     slices[rank][:, :len(expected)].T,
                     np.array(expected, np.int32).reshape(-1, 3))
 
-    def test_verify_windows_leave_their_rows_to_the_device(self):
-        # Note: under async scheduling the host's lengths overcount the
-        # previous step's rejected drafts, so the decode requests' windows
-        # are appended on the device from the corrected lengths.
-        seq_lens_per_rank = [[(16, 300), (3, 129)], [(16, 50), (40, 457)]]
-        step = host_step(seq_lens_per_rank,
-                         bucket=256,
-                         num_decode_per_rank=[2, 1])
-        backend = fa.FlywheelAttentionBackend()
-        backend.max_decode_query_len = 16
-
-        arrays = prepare(step, backend)
-
-        assert step_kernel(arrays, 256) == fa._EXTEND_PHASE
-        for gid, page_size in enumerate(PAGE_SIZES):
-            md = backend.backend_metadata(arrays, gid)
-            bound = fa.kv_write_slice_bound(256, MAX_REQS_PER_RANK, page_size)
-            slices = np.asarray(md.kv_write_slices).reshape(2, 3, bound)
-            for rank, requests in enumerate(seq_lens_per_rank):
-                q_lens = [q_len for q_len, _ in requests]
-                num_decode = int(step.request_distribution[3 * rank])
-                expected = naive_kv_write_slices(
-                    [0, *np.cumsum(q_lens).tolist()][num_decode:],
-                    [kv_len for _, kv_len in requests][num_decode:],
-                    step.block_tables[gid][rank * MAX_REQS_PER_RANK +
-                                           num_decode:], page_size)
-                assert md.kv_write_num_slices[rank] == len(expected)
-                np.testing.assert_array_equal(
-                    slices[rank][:, :len(expected)].T,
-                    np.array(expected, np.int32).reshape(-1, 3))
-
     @pytest.mark.parametrize(("seq_lens_per_rank", "kernel"), [
         ([[(1000, 1000)], [(700, 700)]], fa._DENSE_KERNEL),
         ([[(500, 500), (500, 500)], [(700, 700)]], 512),
         ([[(1, 300), (1, 129)], [(1, 50)]], fa._DECODE_PHASE),
     ])
     def test_picks_its_kernel_on_the_host(self, seq_lens_per_rank, kernel):
-        arrays = prepare(host_step(seq_lens_per_rank, bucket=1024))
+        arrays = prepare(host_step(seq_lens_per_rank, bucket=1024),
+                         fa.FlywheelAttentionBackend())
 
         assert step_kernel(arrays, 1024) == kernel
 
@@ -550,7 +532,8 @@ class TestPrepareStep:
         ([[(128, 128)] * 4, [(1000, 1000)]], 1024),
     ])
     def test_the_warmup_primes_the_step(self, mesh, seq_lens_per_rank, bucket):
-        arrays = prepare(host_step(seq_lens_per_rank, bucket))
+        arrays = prepare(host_step(seq_lens_per_rank, bucket),
+                         fa.FlywheelAttentionBackend())
 
         backend = fa.FlywheelAttentionBackend()
         warmup_arrays = backend.warmup_arrays(

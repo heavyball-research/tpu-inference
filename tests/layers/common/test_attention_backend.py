@@ -155,11 +155,10 @@ def test_attention_runs_the_given_backend(mesh):
 
 def test_attention_runs_the_default_backend_when_given_none(
         mesh, monkeypatch):
-    # Note: the flax models' layers name no backend; the runner sets its own
-    # as the default.
-    monkeypatch.setattr(attention_interface, "_default_attention_backend",
-                        None)
-    attention_interface.set_default_attention_backend(FakeAttentionBackend())
+    # Note: the flax models' layers name no backend, so they must run the
+    # one the runner sets as the default.
+    monkeypatch.setattr(attention_interface, "default_attention_backend",
+                        FakeAttentionBackend())
     q = jnp.ones((NUM_TOKENS, NUM_HEADS, HEAD_DIM), jnp.bfloat16)
     k = v = jnp.ones((NUM_TOKENS, 1, HEAD_DIM), jnp.bfloat16)
     kv_cache = jnp.zeros((2, 16, 2, HEAD_DIM), jnp.bfloat16)

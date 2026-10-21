@@ -345,16 +345,13 @@ def paged_cache_windows(
     causal: bool,
     sm_scale: float,
 ) -> tuple[jax.Array, jax.Array]:
-    """The rows of the leading num_active requests, each at most window_len
-    tokens already in the pages (a speculative verify window, or a draft
-    model's noise block), against the paged cache; returns all T rows, those
-    of other requests unspecified, and the cache the kernel aliased through.
+    """Attention of the leading num_active requests, each at most window_len
+    tokens already in the pages, as (num_windows, window_len) windows on the
+    decode kernel; rows of other requests come back unspecified.
 
-    Each request's rows sit right-aligned in a (window_len,) window, padding
-    slots first, so the bottom-right causal bound of flash_attn_with_kvcache
-    puts row i of a q_len-token window at kv_len - q_len + i, its position.
-    The (num_windows, window_len) call runs the decode kernel with the
-    window folded into the query heads.
+    Each request's rows sit right-aligned in its window, padding slots first,
+    so the bottom-right causal bound puts row i of a q_len-token window at its
+    position, kv_len - q_len + i.
     """
     num_rows = q.shape[0]
     max_num_seqs = kv_lens.shape[0]
@@ -387,6 +384,44 @@ def paged_cache_windows(
         num_windows * window_len - 1)
     return output.reshape(num_windows * window_len,
                           *output.shape[2:])[window_slot], cache
+
+
+def append_rows_at_kv_lens(
+    cache: jax.Array,
+    k: jax.Array,  # [T, H, D]
+    v: jax.Array,  # [T, H, D]
+    kv_lens: jax.Array,  # i32[max_num_seqs], includes these rows
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    num_requests: jax.Array,  # i32 scalar
+) -> jax.Array:
+    """Writes the leading num_requests requests' K/V rows at the positions
+    kv_lens gives on the device."""
+    return append_ragged(cache,
+                         k,
+                         v,
+                         cu_q_lens,
+                         kv_lens - (cu_q_lens[1:] - cu_q_lens[:-1]),
+                         page_indices,
+                         num_requests.reshape(1),
+                         page_size=cache.shape[1],
+                         pages_per_seq=page_indices.shape[0] //
+                         kv_lens.shape[0],
+                         interpret=False)
+
+
+def pad_head_dim(q: jax.Array, k: jax.Array,
+                 v: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """q, k and v padded to the kernels' head_dim (align_head_dim)."""
+    head_dim = q.shape[-1]
+    padded_head_dim = align_head_dim(head_dim)
+    if padded_head_dim == head_dim:
+        return q, k, v
+    else:
+        # Note: the cache is allocated at the padded head_dim once, so only
+        # this step's activations need padding.
+        padding = ((0, 0), (0, 0), (0, padded_head_dim - head_dim))
+        return tuple(jnp.pad(activation, padding) for activation in (q, k, v))
 
 
 def _paged_extend_rows(
@@ -548,10 +583,9 @@ def flywheel_tpu_attention(
     """One shard's attention for any step, in one executable per bucket.
 
     The DMA writer copies the K/V of the rows after the leading decode rows
-    into the pages. With max_decode_query_len 1 the decode kernel appends and
-    attends the decode rows, one each. Above 1 a decode request is a window
-    of up to that many rows (speculative verify): the ragged append writes
-    them and paged_cache_windows attends them. Then lax.switch runs
+    into the pages. The decode kernel then appends and attends the decode
+    requests: one token each, or with max_decode_query_len > 1 verify windows
+    of up to that many tokens. Then lax.switch runs
     step_kernels(T)[kernel_index] on the other rows. Every switch branch only
     reads the cache: a branch that wrote it would make XLA copy the whole
     cache per layer.
@@ -565,15 +599,7 @@ def flywheel_tpu_attention(
     if k.shape[-1] != head_dim or v.shape != k.shape:
         raise ValueError(
             "Q/K/V must share head_dim and K/V shapes must match.")
-    padded_head_dim = align_head_dim(head_dim)
-    if padded_head_dim == head_dim:
-        padded_q, padded_k, padded_v = q, k, v
-    else:
-        # Note: the cache is allocated at the padded head_dim once,
-        # so only this step's activations need padding.
-        padding = ((0, 0), (0, 0), (0, padded_head_dim - head_dim))
-        padded_q, padded_k, padded_v = (jnp.pad(activation, padding)
-                                        for activation in (q, k, v))
+    padded_q, padded_k, padded_v = pad_head_dim(q, k, v)
     num_decode = request_distribution[0]
     num_active = request_distribution[2]
     # Note: per-rank metadata is sharded as flat arrays, so the
@@ -598,19 +624,9 @@ def flywheel_tpu_attention(
         # draft of the previous step as accepted, and the device subtracts the
         # rejected ones from kv_lens afterwards (_subtract_num_rejected_tokens),
         # so the writer's host-built slices would put a window's K/V past its
-        # place. The ragged append writes the decode rows from kv_lens.
-        max_num_seqs = kv_lens.shape[0]
-        cache = append_ragged(cache,
-                              padded_k,
-                              padded_v,
-                              cu_q_lens,
-                              kv_lens - (cu_q_lens[1:] - cu_q_lens[:-1]),
-                              page_indices,
-                              num_decode.reshape(1),
-                              page_size=cache.shape[1],
-                              pages_per_seq=page_indices.shape[0] //
-                              max_num_seqs,
-                              interpret=False)
+        # place.
+        cache = append_rows_at_kv_lens(cache, padded_k, padded_v, kv_lens,
+                                       page_indices, cu_q_lens, num_decode)
         decode_output, cache = paged_cache_windows(
             padded_q,
             cache,
@@ -677,7 +693,7 @@ def sharded_flywheel_tpu_attention(
             sm_scale=sm_scale,
             max_decode_query_len=max_decode_query_len)
 
-    return _shard_over_kv_heads(_attention, mesh, q, k, v, kv_cache, kv_lens,
+    return shard_over_kv_heads(_attention, mesh, q, k, v, kv_cache, kv_lens,
                                 page_indices, cu_q_lens, kv_write_slices,
                                 kv_write_num_slices, request_distribution,
                                 kernel_index)
@@ -698,34 +714,18 @@ def flywheel_tpu_device_attention(
     window_len: int,
 ) -> tuple[jax.Array, jax.Array]:
     """One shard's attention over rows the step's host metadata does not
-    describe, e.g. a draft model's own tokens: the ragged append writes every
-    row's K/V from the device-side lengths, then window_len > 1 attends each
-    request's rows (at most window_len) as one window, and window_len 1 runs
-    the paged varlen kernel over the packed rows. Rows past the requests'
-    are 0."""
+    describe, e.g. a draft model's own tokens, from the device-side lengths:
+    each request as one window of at most window_len rows, or with
+    window_len 1 the packed rows on the paged varlen kernel. Rows past the
+    requests' are 0."""
     head_dim = q.shape[-1]
-    padded_head_dim = align_head_dim(head_dim)
-    if padded_head_dim == head_dim:
-        padded_q, padded_k, padded_v = q, k, v
-    else:
-        padding = ((0, 0), (0, 0), (0, padded_head_dim - head_dim))
-        padded_q, padded_k, padded_v = (jnp.pad(activation, padding)
-                                        for activation in (q, k, v))
+    padded_q, padded_k, padded_v = pad_head_dim(q, k, v)
     num_active = request_distribution[2]
     max_num_seqs = kv_lens.shape[0]
     page_size = kv_cache.shape[1]
     pages_per_seq = page_indices.shape[0] // max_num_seqs
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    cache = append_ragged(kv_cache,
-                          padded_k,
-                          padded_v,
-                          cu_q_lens,
-                          kv_lens - q_lens,
-                          page_indices,
-                          num_active.reshape(1),
-                          page_size=page_size,
-                          pages_per_seq=pages_per_seq,
-                          interpret=False)
+    cache = append_rows_at_kv_lens(kv_cache, padded_k, padded_v, kv_lens,
+                                   page_indices, cu_q_lens, num_active)
     if window_len > 1:
         output, cache = paged_cache_windows(padded_q,
                                             cache,
@@ -780,11 +780,11 @@ def sharded_flywheel_tpu_device_attention(
                                              causal=causal,
                                              window_len=window_len)
 
-    return _shard_over_kv_heads(_attention, mesh, q, k, v, kv_cache, kv_lens,
+    return shard_over_kv_heads(_attention, mesh, q, k, v, kv_cache, kv_lens,
                                 page_indices, cu_q_lens, request_distribution)
 
 
-def _shard_over_kv_heads(
+def shard_over_kv_heads(
     attention_fn,
     mesh: Mesh,
     q: jax.Array,
@@ -1026,11 +1026,8 @@ class FlywheelAttentionBackend(AttentionBackend):
     ) -> tuple[jax.Array, jax.Array]:
         # Note: the kernels pad head_dim themselves (align_head_dim), so q
         # arrives at the model's head_dim and head_dim_original is unused.
-        # Without backend metadata the rows are not the step's tokens (a
-        # draft model's own), so the device step writes and attends them from
-        # md's lengths alone; decode_query_size > 1 says each request has at
-        # most that many rows. The step's own tokens ignore it: their decode
-        # requests hold up to max_decode_query_len.
+        # Rows without backend metadata are not the step's tokens (a draft
+        # model's own), so the device step attends them from md's lengths.
         flywheel_md = md.backend_metadata
         is_device_step = flywheel_md is None
         check_supported(

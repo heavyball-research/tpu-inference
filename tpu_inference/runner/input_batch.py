@@ -68,8 +68,6 @@ class InputBatch:
     ):
         self.is_spec_decode = is_spec_decode
         self.num_speculative_tokens = num_speculative_tokens
-        # The attention backend's max_decode_query_len: the most tokens its
-        # decode kernel takes per request.
         self.backend_max_decode_tokens = backend_max_decode_tokens
         self.max_num_reqs = max_num_reqs
         self.dp_size = dp_size

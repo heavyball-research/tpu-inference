@@ -76,9 +76,9 @@ class AttentionBackend(abc.ABC):
     executable per token bucket, as for RPA, so the metadata holds only device
     arrays: a static field would compile one executable per value."""
 
-    # The most query tokens a request of a step's decode segment (the leading
-    # request_distribution[0] requests) schedules; configure may raise it to a
-    # speculative verify window, num_speculative_tokens + 1.
+    # Note: a backend that attends speculative verify windows on its decode
+    # kernel raises this in configure, so the runner keeps those requests in
+    # the decode segment.
     max_decode_query_len: int = 1
 
     @abc.abstractmethod
@@ -119,9 +119,8 @@ class AttentionBackend(abc.ABC):
         TpuPlatform.check_and_update_config, before any worker starts."""
 
     def configure(self, vllm_config: "VllmConfig") -> None:
-        """Read what the backend's kernels need from the engine configuration.
-        The runner calls it once on its backend, which attention_interface
-        then runs for every layer that names no backend."""
+        """Read what the kernels need from the engine configuration; the
+        runner calls it once on its backend."""
 
     def prepare_step(self, step: HostStepInputs,
                      device_buffer: "DeviceBuffer") -> None:
@@ -268,19 +267,19 @@ def attention_backend_name(vllm_config: "VllmConfig") -> str:
     return RPAAttentionBackend.name
 
 
-_ATTENTION_BACKENDS: dict[str, AttentionBackend] = {}
+ATTENTION_BACKENDS: dict[str, AttentionBackend] = {}
 
 
 def create_attention_backend(name: str) -> AttentionBackend:
-    """The attention backend of that name, one instance per name, so that
-    the vLLM layers, which look their backend up by name, run the instance
-    the runner configured."""
-    if name not in _ATTENTION_BACKENDS:
+    """The attention backend of that name. One instance per name, so the
+    vLLM layers, which look their backend up by name, run the one the runner
+    configured."""
+    if name not in ATTENTION_BACKENDS:
         if name == RPAAttentionBackend.name:
-            _ATTENTION_BACKENDS[name] = RPAAttentionBackend()
+            ATTENTION_BACKENDS[name] = RPAAttentionBackend()
         else:
-            _ATTENTION_BACKENDS[name] = _REGISTERED_BACKENDS[name].attention()
-    return _ATTENTION_BACKENDS[name]
+            ATTENTION_BACKENDS[name] = _REGISTERED_BACKENDS[name].attention()
+    return ATTENTION_BACKENDS[name]
 
 
 def create_linear_attention_backend(name: str) -> LinearAttentionBackend:

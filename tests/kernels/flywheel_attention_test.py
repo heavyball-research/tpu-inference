@@ -263,9 +263,8 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
     def run_device_case(self, seq_lens: list[tuple[int, int]],
                         num_heads: tuple[int, int], *, causal: bool,
                         window_len: int) -> None:
-        """flywheel_tpu_device_attention, the attention of rows the step's
-        host metadata does not describe (a draft model's), against
-        ref_ragged_paged_attention: it writes every row and attends them."""
+        """flywheel_tpu_device_attention's output and written cache against
+        ref_ragged_paged_attention."""
         num_q_heads, num_kv_heads = num_heads
         rng = np.random.default_rng(99)
         max_num_seqs, page_size = 8, 128
@@ -276,7 +275,8 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
 
         cu_q = np.concatenate([[0], np.cumsum([q for q, _ in seq_lens])])
         kv_lens = [kv for _, kv in seq_lens]
-        # Note: a draft's noise block fills max_num_seqs windows exactly.
+        # Note: 128 tokens hold max_num_seqs windows of up to 16, a DFlash
+        # noise block, so every window fits the bucket.
         num_tokens = 128
         assert cu_q[-1] <= num_tokens and max_num_seqs * window_len <= 128
         pages_per_seq = -(-max(kv_lens) // page_size)
