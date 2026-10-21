@@ -15,6 +15,7 @@
 (--attention-backend flywheel)."""
 
 import functools
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -71,6 +72,14 @@ def align_head_dim(head_dim: int) -> int:
 # Note: at a padded head_dim with 2 KV heads per chip the decode
 # kernel's rows come out near zero, so it runs only where no padding is needed.
 _DECODE_HEAD_DIMS = (128, 256)
+
+# Note: the decode kernel's KV block is the widest run of whole pages,
+# within its staging budget, that divides the table's capacity
+# (pages_per_seq * page_size). A prime page count such as 37 leaves it one
+# page per block, so its table is padded to a multiple of this many tokens.
+# The padded entries lie past every row's length, where the kernel loads
+# nothing.
+_DECODE_TABLE_ALIGN_TOKENS = 2048
 
 
 def kv_write_slice_bound(num_tokens: int, max_num_seqs: int,
@@ -307,6 +316,11 @@ def paged_cache_decode(
     batch = min(max_num_seqs, q.shape[0])
     block_table = page_indices[:batch * pages_per_seq].reshape(
         batch, pages_per_seq)
+    page_size = kv_cache.shape[1]
+    pages_per_align = _DECODE_TABLE_ALIGN_TOKENS // math.gcd(
+        _DECODE_TABLE_ALIGN_TOKENS, page_size)
+    pad_pages = align_to(pages_per_seq, pages_per_align) - pages_per_seq
+    block_table = jnp.pad(block_table, ((0, 0), (0, pad_pages)))
     has_new_kv = k is not None
     # Note: kv_lens count this step's token, so an in-kernel append
     # takes the length before it (padding rows go to -1, which the kernel
