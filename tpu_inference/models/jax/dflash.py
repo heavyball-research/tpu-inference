@@ -200,6 +200,8 @@ class DFlashAttention(nnx.Module):
             sm_scale=self.head_dim_original**-0.5,
             use_causal_mask=False,  # Noise tokens attend to all KV tokens
             update_kv_cache=True,
+            # Note: every request's noise block is block_size tokens.
+            decode_query_size=block_size,
         )
 
         # attn_out is already (T_noise, num_heads, head_dim)

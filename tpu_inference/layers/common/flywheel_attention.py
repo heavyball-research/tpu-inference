@@ -27,6 +27,7 @@ import torch
 from flywheel_tpu import flash_attn_func, flash_attn_with_kvcache
 from flywheel_tpu.flash_attn_interface import PAGE_SIZE_MULTIPLE
 from flywheel_tpu.pallas.block_sizes import FWD_BLOCKS, NUM_LANES
+from flywheel_tpu.pallas.flash_fwd_kvcache_varlen import append_ragged
 from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
 from jax import lax
 from jax.sharding import Mesh, NamedSharding
@@ -139,8 +140,10 @@ _DENSE_PAD_MULTIPLE = NUM_LANES
 _DENSE_MAX_BLOCK = max(FWD_BLOCKS)
 
 
-def select_attention_phase(num_decode: int, cu_q_lens: np.ndarray,
-                           kv_lens: np.ndarray) -> str:
+def select_attention_phase(num_decode: int,
+                           cu_q_lens: np.ndarray,
+                           kv_lens: np.ndarray,
+                           max_decode_query_len: int = 1) -> str:
     """A rank's attention phase, from this step's own host lengths.
 
     PREFILL is a step of fresh prefill requests alone (kv_len == q_len and no
@@ -148,14 +151,16 @@ def select_attention_phase(num_decode: int, cu_q_lens: np.ndarray,
     mixed step, or a request whose keys are partly in the pages, is EXTEND.
     """
     q_lens = np.diff(cu_q_lens)
-    if np.any(q_lens[:num_decode] != 1):
-        # Note: the decode kernel takes the leading num_decode rows
-        # as one token each, so a runner that stops ordering decode requests
-        # first has to fail here instead of attending the wrong rows.
+    decode_q_lens = q_lens[:num_decode]
+    if np.any((decode_q_lens < 1) | (decode_q_lens > max_decode_query_len)):
+        # Note: the decode kernel takes the leading num_decode requests
+        # as up to max_decode_query_len tokens each, so a runner that stops
+        # ordering decode requests first has to fail here instead of
+        # attending the wrong rows.
         raise ValueError(
-            "A batch must put its decode requests first, one query each; got "
-            f"q_lens {q_lens[:num_decode].tolist()} for the leading "
-            f"{num_decode}.")
+            "A batch must put its decode requests first, 1 to "
+            f"{max_decode_query_len} queries each; got q_lens "
+            f"{decode_q_lens.tolist()} for the leading {num_decode}.")
     elif num_decode == kv_lens.size:
         return _DECODE_PHASE
     elif num_decode > 0 or np.any(kv_lens != q_lens):
@@ -328,6 +333,62 @@ def paged_cache_decode(
     return output[:, 0], cache
 
 
+def paged_cache_windows(
+    q: jax.Array,  # [T, N, D]
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,  # i32[max_num_seqs], includes the windows' tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    num_active: jax.Array,  # i32 scalar: leading requests that are windows
+    *,
+    window_len: int,
+    causal: bool,
+    sm_scale: float,
+) -> tuple[jax.Array, jax.Array]:
+    """The rows of the leading num_active requests, each at most window_len
+    tokens already in the pages (a speculative verify window, or a draft
+    model's noise block), against the paged cache; returns all T rows, those
+    of other requests unspecified, and the cache the kernel aliased through.
+
+    Each request's rows sit right-aligned in a (window_len,) window, padding
+    slots first, so the bottom-right causal bound of flash_attn_with_kvcache
+    puts row i of a q_len-token window at kv_len - q_len + i, its position.
+    The (num_windows, window_len) call runs the decode kernel with the
+    window folded into the query heads.
+    """
+    num_rows = q.shape[0]
+    max_num_seqs = kv_lens.shape[0]
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    num_windows = min(max_num_seqs, num_rows)
+    starts = cu_q_lens[:num_windows]
+    padding = window_len - (cu_q_lens[1:num_windows + 1] - starts)
+    # Note: rows of a request past num_active may be longer than a window
+    # (negative padding); its window is clamped in range and never attended.
+    window_rows = jnp.clip(
+        starts[:, None] + jnp.arange(window_len)[None, :] - padding[:, None],
+        0, num_rows - 1)
+    output, cache = flash_attn_with_kvcache(
+        q[window_rows],
+        kv_cache,
+        None,
+        cache_seqlens=kv_lens[:num_windows],
+        block_table=page_indices[:num_windows * pages_per_seq].reshape(
+            num_windows, pages_per_seq),
+        num_active=num_active,
+        causal=causal,
+        softmax_scale=sm_scale,
+    )
+    row = jnp.arange(num_rows)
+    request = jnp.clip(
+        jnp.searchsorted(cu_q_lens[1:num_windows + 1], row, side="right"), 0,
+        num_windows - 1)
+    window_slot = jnp.clip(
+        request * window_len + row - starts[request] + padding[request], 0,
+        num_windows * window_len - 1)
+    return output.reshape(num_windows * window_len,
+                          *output.shape[2:])[window_slot], cache
+
+
 def _paged_extend_rows(
     q: jax.Array,  # [T, N, D]
     kv_cache: jax.Array,
@@ -482,14 +543,18 @@ def flywheel_tpu_attention(
     kernel_index: jax.Array,  # i32[1]: into step_kernels(T)
     *,
     sm_scale: float,
+    max_decode_query_len: int,
 ) -> tuple[jax.Array, jax.Array]:
     """One shard's attention for any step, in one executable per bucket.
 
     The DMA writer copies the K/V of the rows after the leading decode rows
-    into the pages, and the decode kernel appends and attends the decode
-    rows. Then lax.switch runs step_kernels(T)[kernel_index] on the other
-    rows. Every switch branch only reads the cache: a branch that wrote it
-    would make XLA copy the whole cache per layer.
+    into the pages. With max_decode_query_len 1 the decode kernel appends and
+    attends the decode rows, one each. Above 1 a decode request is a window
+    of up to that many rows (speculative verify): the ragged append writes
+    them and paged_cache_windows attends them. Then lax.switch runs
+    step_kernels(T)[kernel_index] on the other rows. Every switch branch only
+    reads the cache: a branch that wrote it would make XLA copy the whole
+    cache per layer.
 
     request_distribution is this rank's (decode_end, prefill_end, mixed_end),
     RPA's cumulative request counts of its three request groups. The runner
@@ -518,14 +583,45 @@ def flywheel_tpu_attention(
                                  kv_write_num_slices)
     # Note: the cache threads writer -> decode kernel so the one donated
     # buffer aliases the chain, outside the switch.
-    decode_output, cache = paged_cache_decode(padded_q,
-                                              padded_k,
-                                              padded_v,
-                                              cache,
-                                              kv_lens,
-                                              page_indices,
-                                              num_decode,
-                                              sm_scale=sm_scale)
+    if max_decode_query_len == 1:
+        decode_output, cache = paged_cache_decode(padded_q,
+                                                  padded_k,
+                                                  padded_v,
+                                                  cache,
+                                                  kv_lens,
+                                                  page_indices,
+                                                  num_decode,
+                                                  sm_scale=sm_scale)
+        num_decode_rows = num_decode
+    else:
+        # Note: under async scheduling the host's lengths count every
+        # draft of the previous step as accepted, and the device subtracts the
+        # rejected ones from kv_lens afterwards (_subtract_num_rejected_tokens),
+        # so the writer's host-built slices would put a window's K/V past its
+        # place. The ragged append writes the decode rows from kv_lens.
+        max_num_seqs = kv_lens.shape[0]
+        cache = append_ragged(cache,
+                              padded_k,
+                              padded_v,
+                              cu_q_lens,
+                              kv_lens - (cu_q_lens[1:] - cu_q_lens[:-1]),
+                              page_indices,
+                              num_decode.reshape(1),
+                              page_size=cache.shape[1],
+                              pages_per_seq=page_indices.shape[0] //
+                              max_num_seqs,
+                              interpret=False)
+        decode_output, cache = paged_cache_windows(
+            padded_q,
+            cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            num_decode,
+            window_len=max_decode_query_len,
+            causal=True,
+            sm_scale=sm_scale)
+        num_decode_rows = cu_q_lens[num_decode]
 
     # Note: each branch binds one step_kernels entry, a Python value, when
     # the backbone is traced; the traced kernel_index only picks a branch.
@@ -536,20 +632,20 @@ def flywheel_tpu_attention(
     output = lax.switch(kernel_index[0], branches, padded_q, padded_k,
                         padded_v, cache, kv_lens, page_indices, cu_q_lens,
                         num_decode, num_active)
-    # Note: the leading rows take the decode kernel's output below
-    # num_decode and zeros past the scheduled tokens: a branch need not own
-    # the rows below its first request (row num_decode), and a decode-only
-    # rank leaves it no request. num_decode never exceeds num_leading_rows.
+    # Note: the leading rows take the decode kernel's output below the
+    # decode requests' rows and zeros past the scheduled tokens: a branch need
+    # not own the rows below its first request, and a decode-only rank leaves
+    # it no request. num_decode_rows never exceeds num_leading_rows.
     num_leading_rows = min(align_to(decode_output.shape[0], 8),
                            padded_q.shape[0])
-    # Note: shape padding only; num_decode cannot reach these rows.
+    # Note: shape padding only; num_decode_rows cannot reach these rows.
     padded_decode_output = jnp.pad(
         decode_output,
         ((0, num_leading_rows - decode_output.shape[0]), (0, 0), (0, 0)))
     row_index = jnp.arange(num_leading_rows)[:, None, None]
     num_scheduled_tokens = cu_q_lens[num_active]
     leading_output = jnp.where(
-        row_index < num_decode, padded_decode_output,
+        row_index < num_decode_rows, padded_decode_output,
         jnp.where(row_index < num_scheduled_tokens, output[:num_leading_rows],
                   0))
     output = output.at[:num_leading_rows].set(leading_output)
@@ -571,8 +667,135 @@ def sharded_flywheel_tpu_attention(
     kernel_index: jax.Array,  # i32[dp]
     *,
     sm_scale: float,
+    max_decode_query_len: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Shards along KV heads, mirroring sharded_ragged_paged_attention."""
+
+    def _attention(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return flywheel_tpu_attention(
+            *args,
+            sm_scale=sm_scale,
+            max_decode_query_len=max_decode_query_len)
+
+    return _shard_over_kv_heads(_attention, mesh, q, k, v, kv_cache, kv_lens,
+                                page_indices, cu_q_lens, kv_write_slices,
+                                kv_write_num_slices, request_distribution,
+                                kernel_index)
+
+
+def flywheel_tpu_device_attention(
+    q: jax.Array,  # [T, N, D]
+    k: jax.Array,  # [T, H, D]
+    v: jax.Array,  # [T, H, D]
+    kv_cache: jax.Array,  # [num_pages, page_size, 2 * H, D]
+    kv_lens: jax.Array,  # i32[max_num_seqs], includes these rows
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    request_distribution: jax.Array,  # i32[3]
+    *,
+    sm_scale: float,
+    causal: bool,
+    window_len: int,
+) -> tuple[jax.Array, jax.Array]:
+    """One shard's attention over rows the step's host metadata does not
+    describe, e.g. a draft model's own tokens: the ragged append writes every
+    row's K/V from the device-side lengths, then window_len > 1 attends each
+    request's rows (at most window_len) as one window, and window_len 1 runs
+    the paged varlen kernel over the packed rows. Rows past the requests'
+    are 0."""
+    head_dim = q.shape[-1]
+    padded_head_dim = align_head_dim(head_dim)
+    if padded_head_dim == head_dim:
+        padded_q, padded_k, padded_v = q, k, v
+    else:
+        padding = ((0, 0), (0, 0), (0, padded_head_dim - head_dim))
+        padded_q, padded_k, padded_v = (jnp.pad(activation, padding)
+                                        for activation in (q, k, v))
+    num_active = request_distribution[2]
+    max_num_seqs = kv_lens.shape[0]
+    page_size = kv_cache.shape[1]
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    cache = append_ragged(kv_cache,
+                          padded_k,
+                          padded_v,
+                          cu_q_lens,
+                          kv_lens - q_lens,
+                          page_indices,
+                          num_active.reshape(1),
+                          page_size=page_size,
+                          pages_per_seq=pages_per_seq,
+                          interpret=False)
+    if window_len > 1:
+        output, cache = paged_cache_windows(padded_q,
+                                            cache,
+                                            kv_lens,
+                                            page_indices,
+                                            cu_q_lens,
+                                            num_active,
+                                            window_len=window_len,
+                                            causal=causal,
+                                            sm_scale=sm_scale)
+        row_index = jnp.arange(output.shape[0])[:, None, None]
+        output = jnp.where(row_index < cu_q_lens[num_active], output, 0)
+    else:
+        output = flash_attn_varlen_func(
+            padded_q.transpose(1, 0, 2),
+            cache,
+            None,
+            cu_q_lens,
+            None,
+            max_seqlen_q=padded_q.shape[0],
+            max_seqlen_k=pages_per_seq * page_size,
+            softmax_scale=sm_scale,
+            causal=causal,
+            token_major=False,
+            block_table=page_indices.reshape(max_num_seqs, pages_per_seq),
+            seqused_k=kv_lens,
+            num_active=num_active,
+        ).transpose(1, 0, 2)
+    return output[..., :head_dim], cache
+
+
+def sharded_flywheel_tpu_device_attention(
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    request_distribution: jax.Array,  # i32[dp * 3]
+    *,
+    sm_scale: float,
+    causal: bool,
+    window_len: int,
+) -> tuple[jax.Array, jax.Array]:
+    """flywheel_tpu_device_attention, sharded along KV heads."""
+
+    def _attention(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return flywheel_tpu_device_attention(*args,
+                                             sm_scale=sm_scale,
+                                             causal=causal,
+                                             window_len=window_len)
+
+    return _shard_over_kv_heads(_attention, mesh, q, k, v, kv_cache, kv_lens,
+                                page_indices, cu_q_lens, request_distribution)
+
+
+def _shard_over_kv_heads(
+    attention_fn,
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    *metadata: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """attention_fn(q, k, v, kv_cache, *metadata) shard-mapped along KV heads
+    (each metadata array split along the data axis), mirroring
+    sharded_ragged_paged_attention."""
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
     num_kv_heads = k.shape[1]
     if num_kv_heads >= tp_size:
@@ -592,20 +815,15 @@ def sharded_flywheel_tpu_attention(
     kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
                       ShardingAxisName.ATTN_HEAD, None)
     in_specs = ((qkv_spec, qkv_spec, qkv_spec, kv_cache_spec) +
-                (P(ShardingAxisName.ATTN_DATA), ) * 7)
+                (P(ShardingAxisName.ATTN_DATA), ) * len(metadata))
     out_specs = (qkv_spec, kv_cache_spec)
-
-    def _attention(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return flywheel_tpu_attention(*args, sm_scale=sm_scale)
-
     return jax.shard_map(
-        _attention,
+        attention_fn,
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
         check_vma=False,
-    )(q, sharded_k, sharded_v, kv_cache, kv_lens, page_indices, cu_q_lens,
-      kv_write_slices, kv_write_num_slices, request_distribution, kernel_index)
+    )(q, sharded_k, sharded_v, kv_cache, *metadata)
 
 
 def check_supported(
@@ -619,11 +837,13 @@ def check_supported(
     v_scale: float | None,
     update_kv_cache: bool,
     use_causal_mask: bool,
+    is_device_step: bool = False,
 ) -> None:
     """Raises NotImplementedError for a feature of one attention layer that
     the backend does not support. FlywheelAttentionBackend.check_config has
     already rejected, at startup, what the engine configuration shows
-    (parallelism, speculative decoding, dtypes)."""
+    (parallelism, speculative decoding, dtypes). A device step
+    (flywheel_tpu_device_attention) also attends non-causally."""
     # Note: every served model decodes, and check_config can only check
     # the model's one get_head_size(); a layer of another head_dim would
     # decode wrong rows rather than fail.
@@ -642,8 +862,8 @@ def check_supported(
         any(s is not None for s in (q_scale, k_scale, v_scale)),
         "update_kv_cache=False (KV-share layers)":
         not update_kv_cache,
-        "use_causal_mask=False (non-causal attention)":
-        not use_causal_mask,
+        "use_causal_mask=False (non-causal attention) on the step's tokens":
+        not use_causal_mask and not is_device_step,
     }
     for name, is_unsupported in unsupported.items():
         if is_unsupported:
@@ -717,8 +937,15 @@ class FlywheelAttentionBackend(AttentionBackend):
         if envs.USE_BATCHED_RPA_KERNEL:
             problems.append("USE_BATCHED_RPA_KERNEL selects an RPA kernel; "
                             "unset it")
-        if vllm_config.speculative_config is not None:
-            problems.append("speculative decoding is not supported")
+        speculative_config = vllm_config.speculative_config
+        if (speculative_config is not None
+                and speculative_config.method != "dflash"):
+            # Note: a DFlash draft attends its noise block through
+            # flywheel_tpu_device_attention; the other drafters' attention
+            # steps are not wired to this backend.
+            problems.append(
+                f"speculative decoding method {speculative_config.method!r} "
+                "is not supported; only 'dflash' is")
         if vllm_config.additional_config.get("enable_continue_decode", False):
             # Note: the fused on-device decode loop rebuilds
             # AttentionMetadata without the backend metadata (the KV write
@@ -751,6 +978,17 @@ class FlywheelAttentionBackend(AttentionBackend):
             raise ValueError(
                 "The flywheel attention backend cannot serve this "
                 "configuration: " + "; ".join(problems) + ".")
+
+    def configure(self, vllm_config: "VllmConfig") -> None:
+        # Note: with speculative decoding a decode request is its verify
+        # window, num_speculative_tokens + 1 tokens at most, which the
+        # decode kernel attends folded into its query heads.
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None:
+            self.max_decode_query_len = 1
+        else:
+            self.max_decode_query_len = (
+                speculative_config.num_speculative_tokens + 1)
 
     def get_kv_cache_shape(self, total_num_pages: int, page_size: int,
                            num_kv_heads: int, head_dim: int,
@@ -787,8 +1025,14 @@ class FlywheelAttentionBackend(AttentionBackend):
         decode_query_size: int,
     ) -> tuple[jax.Array, jax.Array]:
         # Note: the kernels pad head_dim themselves (align_head_dim), so q
-        # arrives at the model's head_dim and head_dim_original is unused;
-        # decode_query_size is 1 for every vLLM model.
+        # arrives at the model's head_dim and head_dim_original is unused.
+        # Without backend metadata the rows are not the step's tokens (a
+        # draft model's own), so the device step writes and attends them from
+        # md's lengths alone; decode_query_size > 1 says each request has at
+        # most that many rows. The step's own tokens ignore it: their decode
+        # requests hold up to max_decode_query_len.
+        flywheel_md = md.backend_metadata
+        is_device_step = flywheel_md is None
         check_supported(
             q,
             sinks=sinks,
@@ -799,13 +1043,30 @@ class FlywheelAttentionBackend(AttentionBackend):
             v_scale=v_scale,
             update_kv_cache=update_kv_cache,
             use_causal_mask=use_causal_mask,
+            is_device_step=is_device_step,
         )
-        flywheel_md = md.backend_metadata
+        if is_device_step:
+            output, kv_cache = sharded_flywheel_tpu_device_attention(
+                mesh,
+                q,
+                k,
+                v,
+                kv_cache,
+                md.seq_lens,
+                md.block_tables,
+                md.query_start_loc,
+                md.request_distribution,
+                sm_scale=sm_scale,
+                causal=use_causal_mask,
+                window_len=decode_query_size,
+            )
+            return kv_cache, output
         if not isinstance(flywheel_md, FlywheelMetadata):
             raise ValueError(
                 "The flywheel attention backend needs its step metadata "
                 "(AttentionMetadata.backend_metadata, built by "
-                "FlywheelAttentionBackend.prepare_step); got "
+                "FlywheelAttentionBackend.prepare_step), or None for rows "
+                f"that are not the step's tokens; got "
                 f"{type(flywheel_md).__name__}.")
         output, kv_cache = sharded_flywheel_tpu_attention(
             mesh,
@@ -821,6 +1082,7 @@ class FlywheelAttentionBackend(AttentionBackend):
             shared_md.request_distribution,
             flywheel_md.kernel_index,
             sm_scale=sm_scale,
+            max_decode_query_len=self.max_decode_query_len,
         )
         return kv_cache, output
 
@@ -844,7 +1106,7 @@ class FlywheelAttentionBackend(AttentionBackend):
                     select_attention_phase(
                         int(step.request_distribution[3 * dp_rank]),
                         step.query_start_loc[query_range],
-                        step.seq_lens[req_range]))
+                        step.seq_lens[req_range], self.max_decode_query_len))
         # Note: DP ranks that disagree settle on extend, the only phase
         # that serves cached and fresh requests alike.
         if len(attention_phases) == 1:
@@ -882,8 +1144,9 @@ class FlywheelAttentionBackend(AttentionBackend):
                 (step.dp_size, ), key=f"kv_write_num_slices_gid_{gid}")
             for dp_rank in range(step.dp_size):
                 _, req_range, query_range = _rank_slices(dp_rank)
-                # Note: the decode kernel appends the leading decode rows
-                # itself, so the writer takes only the rows after them.
+                # Note: the decode kernel, or the ragged append of verify
+                # windows, writes the leading decode rows on the device, so
+                # the writer takes only the rows after them.
                 num_decode = int(step.request_distribution[3 * dp_rank])
                 num_slices_view[dp_rank] = build_kv_write_slices(
                     step.query_start_loc[query_range][num_decode:],

@@ -63,6 +63,16 @@ ragged_paged_attention = rpa.ragged_paged_attention
 get_kv_cache_shape = rpa.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
+
+# The backend attention() runs for a layer that names none, the flax models'
+# layers: the runner's --attention-backend once set_default_attention_backend
+# has run, else RPA.
+_default_attention_backend: AttentionBackend | None = None
+
+
+def set_default_attention_backend(backend: AttentionBackend) -> None:
+    global _default_attention_backend
+    _default_attention_backend = backend
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
 
@@ -556,7 +566,8 @@ def attention(
     decode_query_size: int = 1,
     attention_backend: AttentionBackend | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
-    # attention_backend: the TPU attention backend to run; None runs RPA.
+    # attention_backend: the TPU attention backend to run; None runs the
+    # default one (set_default_attention_backend).
     # T: seq_len
     # N: num_heads
     # K: num_kv_heads
@@ -581,7 +592,8 @@ def attention(
     # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
     shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
 
-    return (attention_backend or RPAAttentionBackend()).attention(
+    return (attention_backend or _default_attention_backend
+            or RPAAttentionBackend()).attention(
         kv_cache,
         q,
         k,

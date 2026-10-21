@@ -53,6 +53,8 @@ from tpu_inference import utils as common_utils
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
 from tpu_inference.layers.common.attention_backend import (
     HostStepInputs, attention_backend_name, create_attention_backend)
+from tpu_inference.layers.common.attention_interface import \
+    set_default_attention_backend
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
@@ -801,6 +803,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # --attention-backend selects.
         self.attention_backend = create_attention_backend(
             attention_backend_name(vllm_config))
+        self.attention_backend.configure(vllm_config)
+        # Note: the flax models' layers name no backend, so they run this
+        # one too.
+        set_default_attention_backend(self.attention_backend)
         self.model_config = vllm_config.model_config
         # TODO(jevinjiang): override block size based on RPA v3.
         self.cache_config = vllm_config.cache_config
@@ -1163,6 +1169,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             is_spec_decode=bool(self.vllm_config.speculative_config),
             num_speculative_tokens=num_speculative_tokens,
             dp_size=self.dp_size,
+            backend_max_decode_tokens=(
+                self.attention_backend.max_decode_query_len),
         )
 
         self.positions_cpu = np.zeros(self.max_num_tokens, dtype=np.int32)

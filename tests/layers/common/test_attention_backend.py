@@ -153,6 +153,25 @@ def test_attention_runs_the_given_backend(mesh):
     np.testing.assert_array_equal(output.astype(jnp.float32), FAKE_OUTPUT)
 
 
+def test_attention_runs_the_default_backend_when_given_none(
+        mesh, monkeypatch):
+    # Note: the flax models' layers name no backend; the runner sets its own
+    # as the default.
+    monkeypatch.setattr(attention_interface, "_default_attention_backend",
+                        None)
+    attention_interface.set_default_attention_backend(FakeAttentionBackend())
+    q = jnp.ones((NUM_TOKENS, NUM_HEADS, HEAD_DIM), jnp.bfloat16)
+    k = v = jnp.ones((NUM_TOKENS, 1, HEAD_DIM), jnp.bfloat16)
+    kv_cache = jnp.zeros((2, 16, 2, HEAD_DIM), jnp.bfloat16)
+
+    new_kv_cache, output = attention_interface.attention(
+        kv_cache, q, k, v,
+        AttentionMetadata(input_positions=jnp.arange(NUM_TOKENS)), mesh)
+
+    assert new_kv_cache is kv_cache
+    np.testing.assert_array_equal(output.astype(jnp.float32), FAKE_OUTPUT)
+
+
 def test_kv_cache_shape_comes_from_the_given_backend(mesh):
     args = (mesh, 8, 16, 4, HEAD_DIM, jnp.bfloat16)
 

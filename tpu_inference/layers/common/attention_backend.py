@@ -76,6 +76,11 @@ class AttentionBackend(abc.ABC):
     executable per token bucket, as for RPA, so the metadata holds only device
     arrays: a static field would compile one executable per value."""
 
+    # The most query tokens a request of a step's decode segment (the leading
+    # request_distribution[0] requests) schedules; configure may raise it to a
+    # speculative verify window, num_speculative_tokens + 1.
+    max_decode_query_len: int = 1
+
     @abc.abstractmethod
     def get_kv_cache_shape(self, total_num_pages: int, page_size: int,
                            num_kv_heads: int, head_dim: int,
@@ -112,6 +117,11 @@ class AttentionBackend(abc.ABC):
         """Raise for an engine configuration this backend cannot serve. It may
         adjust the configuration, e.g. the block size. Runs in
         TpuPlatform.check_and_update_config, before any worker starts."""
+
+    def configure(self, vllm_config: "VllmConfig") -> None:
+        """Read what the backend's kernels need from the engine configuration.
+        The runner calls it once on its backend, which attention_interface
+        then runs for every layer that names no backend."""
 
     def prepare_step(self, step: HostStepInputs,
                      device_buffer: "DeviceBuffer") -> None:
@@ -258,11 +268,19 @@ def attention_backend_name(vllm_config: "VllmConfig") -> str:
     return RPAAttentionBackend.name
 
 
+_ATTENTION_BACKENDS: dict[str, AttentionBackend] = {}
+
+
 def create_attention_backend(name: str) -> AttentionBackend:
-    """The attention backend of that name."""
-    if name == RPAAttentionBackend.name:
-        return RPAAttentionBackend()
-    return _REGISTERED_BACKENDS[name].attention()
+    """The attention backend of that name, one instance per name, so that
+    the vLLM layers, which look their backend up by name, run the instance
+    the runner configured."""
+    if name not in _ATTENTION_BACKENDS:
+        if name == RPAAttentionBackend.name:
+            _ATTENTION_BACKENDS[name] = RPAAttentionBackend()
+        else:
+            _ATTENTION_BACKENDS[name] = _REGISTERED_BACKENDS[name].attention()
+    return _ATTENTION_BACKENDS[name]
 
 
 def create_linear_attention_backend(name: str) -> LinearAttentionBackend:

@@ -386,6 +386,11 @@ class DFlashProposer:
                                     block_tables,
                                     sharding=PartitionSpec(
                                         ShardingAxisName.ATTN_DATA))
+        # Note: the attention backend's metadata of the step (e.g. the
+        # flywheel KV write slices) describes the target's tokens, not the
+        # draft's context and noise block, and the warmup traces the draft
+        # without it.
+        attn_metadata = replace(attn_metadata, backend_metadata=None)
 
         return self._prepare_inputs(
             self.state_leaves,

@@ -47,14 +47,16 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                  num_tokens: int = 1024,
                  should_check_cache_copies: bool = True,
                  is_dense: bool = False,
-                 phase: str | None = None) -> None:
+                 phase: str | None = None,
+                 max_decode_query_len: int = 1) -> None:
         """Run one step of seq_lens [(q_len, kv_len)], decode rows first, and
         compare output and updated cache against ref_ragged_paged_attention.
 
         is_dense routes the prefill through the dense kernel, which takes one
         fresh request as a (1, num_tokens) row. phase
         overrides the one the runner picks for these lengths, as a DP step
-        does when its ranks disagree.
+        does when its ranks disagree. max_decode_query_len > 1 makes each
+        decode request a verify window of up to that many rows.
         """
         num_q_heads, num_kv_heads = num_heads
         rng = np.random.default_rng(1234)
@@ -92,13 +94,15 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
         # has to do the same.
         if phase is None:
             phase = fa.select_attention_phase(num_decode, np.asarray(cu_q),
-                                              np.asarray(kv_lens))
+                                              np.asarray(kv_lens),
+                                              max_decode_query_len)
         sm_scale = HEAD_DIM**-0.5
         slice_table = np.zeros(
             (3, fa.kv_write_slice_bound(num_tokens, max_num_seqs, page_size)),
             np.int32)
-        # Note: the decode kernel appends the leading decode rows itself,
-        # so the writer's table holds only the rows after them.
+        # Note: the decode kernel, or the ragged append of verify windows,
+        # writes the leading decode rows itself, so the writer's table holds
+        # only the rows after them.
         num_slices = fa.build_kv_write_slices(
             np.asarray(cu_q_lens)[num_decode:],
             np.asarray(kv_lens_arr)[num_decode:],
@@ -130,7 +134,8 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                                           num_tokens)
         kernel_index = jnp.array([fa.step_kernels(num_tokens).index(kernel)],
                                  jnp.int32)
-        static_kwargs = dict(sm_scale=sm_scale)
+        static_kwargs = dict(sm_scale=sm_scale,
+                             max_decode_query_len=max_decode_query_len)
         run = jax.jit(fa.flywheel_tpu_attention,
                       static_argnames=tuple(static_kwargs),
                       donate_argnums=(3, ))
@@ -234,6 +239,117 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                       num_heads,
                       128,
                       phase=fa._EXTEND_PHASE)
+
+    # Note: speculative verify: each decode request is a window of 1 to
+    # 16 rows, right-aligned in the decode kernel's folded window. (5, 5) is
+    # a fresh short prompt, whose padding slots see no key.
+    @parameterized.product(num_heads=[(24, 4), (16, 2), (8, 1)],
+                           page_size=[128, 256])
+    def test_verify_windows(self, num_heads, page_size):
+        self.run_case([(16, 300), (5, 129), (16, 16), (1, 1000), (5, 5)],
+                      5,
+                      num_heads,
+                      page_size,
+                      max_decode_query_len=16)
+
+    @parameterized.product(num_heads=[(24, 4), (8, 1)])
+    def test_verify_windows_with_a_chunk_on_a_cached_prefix(self, num_heads):
+        self.run_case([(16, 300), (3, 129), (40, 700), (200, 457)],
+                      2,
+                      num_heads,
+                      128,
+                      max_decode_query_len=16)
+
+    def run_device_case(self, seq_lens: list[tuple[int, int]],
+                        num_heads: tuple[int, int], *, causal: bool,
+                        window_len: int) -> None:
+        """flywheel_tpu_device_attention, the attention of rows the step's
+        host metadata does not describe (a draft model's), against
+        ref_ragged_paged_attention: it writes every row and attends them."""
+        num_q_heads, num_kv_heads = num_heads
+        rng = np.random.default_rng(99)
+        max_num_seqs, page_size = 8, 128
+
+        def _gen(shape):
+            return jnp.asarray(rng.standard_normal(
+                shape, dtype=np.float32)).astype(jnp.bfloat16)
+
+        cu_q = np.concatenate([[0], np.cumsum([q for q, _ in seq_lens])])
+        kv_lens = [kv for _, kv in seq_lens]
+        # Note: a draft's noise block fills max_num_seqs windows exactly.
+        num_tokens = 128
+        assert cu_q[-1] <= num_tokens and max_num_seqs * window_len <= 128
+        pages_per_seq = -(-max(kv_lens) // page_size)
+        num_pages = max_num_seqs * pages_per_seq + 3
+        q = _gen((num_tokens, num_q_heads, HEAD_DIM))
+        k = _gen((num_tokens, num_kv_heads, HEAD_DIM))
+        v = _gen((num_tokens, num_kv_heads, HEAD_DIM))
+        kv_cache_v3 = _gen((num_pages, page_size, num_kv_heads, 2, HEAD_DIM))
+        page_indices = jnp.asarray(
+            rng.permutation(num_pages)[:max_num_seqs * pages_per_seq].astype(
+                np.int32))
+        cu_q_lens = jnp.asarray(
+            np.pad(cu_q, (0, max_num_seqs + 1 - len(cu_q)),
+                   mode="edge").astype(np.int32))
+        kv_lens_arr = jnp.asarray(
+            np.pad(kv_lens, (0, max_num_seqs - len(kv_lens))).astype(np.int32))
+        distribution = jnp.array([0, 0, len(seq_lens)], jnp.int32)
+        sm_scale = HEAD_DIM**-0.5
+
+        expected, expected_cache_v3 = ref_ragged_paged_attention(
+            q,
+            k,
+            v,
+            kv_cache_v3,
+            kv_lens_arr,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            use_causal_mask=causal,
+            sm_scale=sm_scale)
+        run = jax.jit(fa.flywheel_tpu_device_attention,
+                      static_argnames=("sm_scale", "causal", "window_len"),
+                      donate_argnums=(3, ))
+        output, updated = run(q,
+                              k,
+                              v,
+                              kv_cache_v3.reshape(num_pages, page_size,
+                                                  2 * num_kv_heads, HEAD_DIM),
+                              kv_lens_arr,
+                              page_indices,
+                              cu_q_lens,
+                              distribution,
+                              sm_scale=sm_scale,
+                              causal=causal,
+                              window_len=window_len)
+
+        total = int(cu_q[-1])
+        self.assertAllClose(output[:total].astype(jnp.float32),
+                            expected[:total].astype(jnp.float32),
+                            atol=5e-2,
+                            rtol=5e-2)
+        self.assertArraysEqual(output[total:],
+                               jnp.zeros_like(output[total:]))
+        self.assertArraysEqual(updated.reshape(kv_cache_v3.shape),
+                               expected_cache_v3)
+
+    # Note: a DFlash draft's noise block: block_size rows per request,
+    # attended non-causally over the context and the whole block.
+    @parameterized.product(num_heads=[(24, 4), (8, 1)], causal=[False, True])
+    def test_device_step_windows(self, num_heads, causal):
+        self.run_device_case([(16, 316), (16, 145), (16, 16), (16, 1016)],
+                             num_heads,
+                             causal=causal,
+                             window_len=16)
+
+    # Note: a DFlash draft's context write: ragged rows, prompt chunks
+    # included, through the paged varlen kernel.
+    @parameterized.product(num_heads=[(24, 4), (8, 1)])
+    def test_device_step_packed_rows(self, num_heads):
+        self.run_device_case([(3, 303), (40, 140), (1, 1), (60, 60)],
+                             num_heads,
+                             causal=True,
+                             window_len=1)
 
 
 if __name__ == "__main__":

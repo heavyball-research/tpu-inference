@@ -64,9 +64,13 @@ class InputBatch:
         is_spec_decode: bool = False,
         num_speculative_tokens: int = 0,
         dp_size: int = 1,
+        backend_max_decode_tokens: int = 1,
     ):
         self.is_spec_decode = is_spec_decode
         self.num_speculative_tokens = num_speculative_tokens
+        # The attention backend's max_decode_query_len: the most tokens its
+        # decode kernel takes per request.
+        self.backend_max_decode_tokens = backend_max_decode_tokens
         self.max_num_reqs = max_num_reqs
         self.dp_size = dp_size
         self.max_model_len = max_model_len
@@ -691,7 +695,7 @@ class InputBatch:
     def max_decode_tokens(self) -> int:
         if self.is_spec_decode and envs.USE_BATCHED_RPA_KERNEL:
             return self.num_speculative_tokens + 1
-        return 1
+        return self.backend_max_decode_tokens
 
     @property
     def max_num_logprobs(self) -> Optional[int]:
