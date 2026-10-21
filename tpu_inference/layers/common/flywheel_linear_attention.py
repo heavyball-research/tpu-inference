@@ -43,20 +43,11 @@ class FlywheelLinearAttentionBackend(LinearAttentionBackend):
         on."""
         return gdn_wrapper.fused_conv1d_gdn_replay
 
-    def replay_record_dim(self, n_kq: int, n_v: int, d_k: int,
-                          d_v: int) -> int:
-        """The last axis of the replay records [u | k] of n_kq key/query heads
-        and n_v value heads, the heads one kernel call sees."""
-        return gdn_wrapper.replay_record_dim(n_kq, n_v, d_k, d_v)
-
-    def replay_gate_dim(self, n_kq: int, n_v: int, d_k: int, d_v: int) -> int:
-        """The last axis of the records' f32 log decays (the replay gates), for
-        the heads one kernel call sees."""
-        return gdn_wrapper.replay_gate_dim(n_kq, n_v, d_k, d_v)
-
-    def replay_checkpoint_shape(self, n_kq: int, n_v: int, d_k: int,
-                                d_v: int) -> tuple[int, ...]:
-        """The per-slot shape of the int32 replay checkpoint, the hi and lo
-        planes of the f32 recurrent state of n_v value heads, (2, n_v,
-        d_k // 2, d_v)."""
-        return gdn_wrapper.replay_checkpoint_shape(n_kq, n_v, d_k, d_v)
+    def replay_layout(self, n_kq: int, n_v: int, d_k: int,
+                      d_v: int) -> gdn_wrapper.ReplayLayout:
+        """The per-slot HBM layout of the ReplaySSM state of n_kq key/query
+        heads and n_v value heads: the int32 checkpoint's shape, the hi and
+        lo planes of the f32 recurrent state, (2, n_v, d_k // 2, d_v), and
+        the last axes of the replay records [u | k] and of their f32 log
+        decays (the replay gates)."""
+        return gdn_wrapper.replay_layout(n_kq, n_v, d_k, d_v)

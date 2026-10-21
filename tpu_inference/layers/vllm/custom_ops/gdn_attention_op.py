@@ -288,17 +288,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if self.replay_window is None:
             return conv_shape, recurrent_shape
         tp_size = self.replay_tp_size
-        local_dims = (self.num_k_heads // tp_size, self.num_v_heads // tp_size,
-                      self.head_k_dim, self.head_v_dim)
-        record_dim = self.linear_attention_backend.replay_record_dim(
-            *local_dims)
-        gate_dim = self.linear_attention_backend.replay_gate_dim(*local_dims)
-        checkpoint_shape = self.linear_attention_backend.replay_checkpoint_shape(
-            self.num_k_heads, self.num_v_heads, self.head_k_dim,
-            self.head_v_dim)
-        return (conv_shape, checkpoint_shape, (self.replay_window,
-                                               tp_size * record_dim),
-                (self.replay_window, tp_size * gate_dim))
+        backend = self.linear_attention_backend
+        global_layout = backend.replay_layout(self.num_k_heads,
+                                              self.num_v_heads,
+                                              self.head_k_dim, self.head_v_dim)
+        shard_layout = backend.replay_layout(self.num_k_heads // tp_size,
+                                             self.num_v_heads // tp_size,
+                                             self.head_k_dim, self.head_v_dim)
+        return (conv_shape, global_layout.checkpoint_shape,
+                (self.replay_window, tp_size * shard_layout.record_dim),
+                (self.replay_window, tp_size * shard_layout.gate_dim))
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         """vLLM's (conv, recurrent) state dtypes. With replay on, the
