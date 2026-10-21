@@ -61,7 +61,6 @@ class HostStepInputs:
     query_start_loc: np.ndarray
     seq_lens: np.ndarray
     request_distribution: np.ndarray
-    scheduled_tokens_per_dp_rank: Mapping[int, Sequence[int]]
     dp_size: int
     max_num_reqs_per_dp_rank: int
     padded_num_scheduled_tokens_per_dp_rank: int

@@ -45,16 +45,9 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                  *,
                  max_num_seqs: int = 8,
                  num_tokens: int = 1024,
-                 should_check_cache_copies: bool = True,
-                 is_dense: bool = False,
-                 phase: str | None = None) -> None:
+                 should_check_cache_copies: bool = True) -> None:
         """Run one step of seq_lens [(q_len, kv_len)], decode rows first, and
         compare output and updated cache against ref_ragged_paged_attention.
-
-        is_dense routes the prefill through the dense kernel, which takes one
-        fresh request as a (1, num_tokens) row. phase
-        overrides the one the runner picks for these lengths, as a DP step
-        does when its ranks disagree.
         """
         num_q_heads, num_kv_heads = num_heads
         rng = np.random.default_rng(1234)
@@ -87,12 +80,8 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
             np.pad(kv_lens, (0, max_num_seqs - len(kv_lens))).astype(np.int32))
         distribution = jnp.array(
             [num_decode, num_decode, len(seq_lens)], jnp.int32)
-        # Note: the runner decides the kernel, an index into the bucket's
-        # step_kernels, and the writer's slice table on the host, so the test
-        # has to do the same.
-        if phase is None:
-            phase = fa.select_attention_phase(num_decode, np.asarray(cu_q),
-                                              np.asarray(kv_lens))
+        # Note: the runner builds the writer's slice table on the host, so
+        # the test has to do the same.
         sm_scale = HEAD_DIM**-0.5
         slice_table = np.zeros(
             (3, fa.kv_write_slice_bound(num_tokens, max_num_seqs, page_size)),
@@ -120,16 +109,6 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
             distribution,
             sm_scale=sm_scale)
 
-        kernel = phase
-        if is_dense:
-            assert num_decode == 0 and len(seq_lens) == 1
-            assert seq_lens[0][0] == seq_lens[0][1]
-            kernel = fa._DENSE_KERNEL
-        elif phase == fa._PREFILL_PHASE:
-            kernel = fa.varlen_block_span([[q_len for q_len, _ in seq_lens]],
-                                          num_tokens)
-        kernel_index = jnp.array([fa.step_kernels(num_tokens).index(kernel)],
-                                 jnp.int32)
         static_kwargs = dict(sm_scale=sm_scale)
         run = jax.jit(fa.flywheel_tpu_attention,
                       static_argnames=tuple(static_kwargs),
@@ -142,8 +121,7 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
         if should_check_cache_copies:
             hlo = run.lower(q, k, v, cache, kv_lens_arr, page_indices,
                             cu_q_lens, kv_write_slices, kv_write_num_slices,
-                            distribution, kernel_index,
-                            **static_kwargs).compile().as_text()
+                            distribution, **static_kwargs).compile().as_text()
             cache_type = "bf16[" + ",".join(map(str, cache.shape)) + "]"
             copies = [
                 line for line in hlo.splitlines()
@@ -153,7 +131,7 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
         pointer = cache.unsafe_buffer_pointer()
         output, updated = run(q, k, v, cache, kv_lens_arr, page_indices,
                               cu_q_lens, kv_write_slices, kv_write_num_slices,
-                              distribution, kernel_index, **static_kwargs)
+                              distribution, **static_kwargs)
         self.assertEqual(updated.unsafe_buffer_pointer(), pointer)
 
         total = cu_q[-1]
@@ -182,20 +160,18 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
         self.run_case([(1, 777)], 1, (24, 4), 128, num_tokens=16)
 
     @parameterized.named_parameters(
-        ("span_256", [(100, 100), (37, 37), (128, 128), (64, 64)]),
-        ("span_512", [(300, 300), (129, 129), (200, 200), (5, 5)]),
-        # Note: the span bounds nothing, so a 1000-token request may
-        # run on 512-token blocks.
-        ("span_below_longest", [(1000, 1000), (24, 24)]),
+        ("short", [(100, 100), (37, 37), (128, 128), (64, 64)]),
+        ("unaligned", [(300, 300), (129, 129), (200, 200), (5, 5)]),
+        ("one_long", [(1000, 1000), (24, 24)]),
     )
-    def test_prefill_at_a_host_chosen_block_span(self, seq_lens):
+    def test_prefill_of_mixed_lengths(self, seq_lens):
         self.run_case(seq_lens, 0, (24, 4), 128)
 
-    # Note: the request need not fill the bucket; the causal mask
-    # keeps its queries off the padded tail.
+    # Note: a fresh-only step of one request, which may or may not fill
+    # the bucket.
     @parameterized.product(num_heads=[(24, 4), (16, 4)], seq_len=[1024, 700])
-    def test_dense_prefill(self, num_heads, seq_len):
-        self.run_case([(seq_len, seq_len)], 0, num_heads, 128, is_dense=True)
+    def test_one_fresh_request(self, num_heads, seq_len):
+        self.run_case([(seq_len, seq_len)], 0, num_heads, 128)
 
     @parameterized.named_parameters(
         ("decode", [(1, 300), (1, 129)], 2),
@@ -220,20 +196,10 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                       should_check_cache_copies=True)
 
     # Note: one long prompt under chunked prefill: no decode row, but
-    # its keys are partly in the pages, so the runner picks extend.
+    # its keys are partly in the pages.
     @parameterized.product(num_heads=[(24, 4), (8, 1)])
     def test_chunk_on_a_cached_prefix_without_decode_rows(self, num_heads):
         self.run_case([(200, 457)], 0, num_heads, 128)
-
-    # Note: with DP, a rank whose own batch is all decode runs the
-    # step's extend executable whenever another rank prefills.
-    @parameterized.product(num_heads=[(24, 4), (8, 1)])
-    def test_decode_only_rank_on_the_extend_executable(self, num_heads):
-        self.run_case([(1, 300), (1, 129)],
-                      2,
-                      num_heads,
-                      128,
-                      phase=fa._EXTEND_PHASE)
 
 
 if __name__ == "__main__":
