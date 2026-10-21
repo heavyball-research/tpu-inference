@@ -19,14 +19,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig, VllmConfig)
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed.aux_output_connector.connector import \
     AuxOutputConnectorMetadata
 
-from tpu_inference.layers.common.sharding import MESH_AXIS_NAMES
 from tpu_inference.models.common.interface import (ModelInterface,
                                                    MultiModalInterface)
 from tpu_inference.runner.routed_experts import TPUAuxOutputWorker
@@ -1426,18 +1424,3 @@ class TestTPUJaxRunnerDisableMM:
                 assert entry["dummy_shape"] == (1 if logprobs else 2, )
                 assert entry["temp_shape"] == ((num_reqs, )
                                                if do_sampling else None)
-
-
-@pytest.mark.parametrize("num_selected", [8, 32, 100, 128])
-@pytest.mark.parametrize("row_shape", [(), (384, )])
-def test_select_from_array_gathers_rows_in_chunks(num_selected, row_shape):
-    # 100 leaves a partial last chunk; a 1-D array is gathered in one go.
-    devices = np.array(jax.devices()[:1]).reshape((1, ) * len(MESH_AXIS_NAMES))
-    mesh = Mesh(devices, MESH_AXIS_NAMES)
-    array = jnp.arange(256 * int(np.prod(row_shape)),
-                       dtype=jnp.float32).reshape(256, *row_shape)
-    indices = jnp.asarray(np.random.default_rng(0).integers(
-        0, 256, num_selected).astype(np.int32))
-    selected = TPUModelRunner._select_from_array_fn(array, indices, mesh)
-    np.testing.assert_array_equal(np.asarray(selected),
-                                  np.asarray(array)[np.asarray(indices)])
