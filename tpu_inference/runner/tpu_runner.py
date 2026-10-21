@@ -2474,10 +2474,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # limit once n grows (e.g. spec decode with max_num_seqs=16:
             # [128, 62080] bf16 = 37.9M -> CompileTimeScopedVmemOom).
             # Gather in fixed-size row chunks so each gather stays small.
-            # Note: the chunks are unrolled. Under lax.map XLA re-splits the
-            # whole loop-invariant array in every iteration, so the cost
-            # grows with n * rows: 16.4 ms for 960 of [1024, 151936] bf16
-            # logits rows (b64 DFlash) against 2.3 ms unrolled.
             chunk = 32
             n = local_indices.shape[0]
             if n <= chunk or local_array.ndim < 2:
