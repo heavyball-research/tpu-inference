@@ -746,6 +746,8 @@ class KVCacheManager:
                 block_sizes=block_sizes,
                 num_speculative_tokens=num_speculative_tokens,
                 dp_size=self.runner.dp_size,
+                max_decode_tokens=(
+                    self.runner.attention_backend.max_decode_query_len),
             )
             self.runner.input_batch = new_input_batch
             self.runner.persistent_batch_manager.input_batch = new_input_batch

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import random
 import string
+from typing import Callable
 
 import pytest
 from vllm import LLM, SamplingParams
@@ -498,7 +499,9 @@ def test_eagle3_performance(
 
 @pytest.fixture(scope="module")
 def dflash_baseline():
-    """Compute the DFlash reference prompts and baseline outputs once."""
+    """Compute the DFlash reference prompts once, and the baseline outputs
+    once per attention backend: the backends' kernels round bf16
+    differently."""
     model_name = 'meta-llama/Llama-3.1-8B-Instruct'
     sampling_config = SamplingParams(temperature=0,
                                      max_tokens=32,
@@ -509,24 +512,34 @@ def dflash_baseline():
                                      min_p=0,
                                      logprobs=None)
     test_prompts = get_eagle3_test_prompts()
-    with pytest.MonkeyPatch.context() as mp:
-        ref_outputs = _get_baseline_results(
-            mp,
-            sampling_config,
-            model_name,
-            test_prompts,
-            max_num_seqs=10,
-            extra_kwargs={"gpu_memory_utilization": 0.85})
-    return test_prompts, ref_outputs
+    ref_outputs = {}
+
+    def get(attention_backend: str | None) -> tuple:
+        if attention_backend not in ref_outputs:
+            with pytest.MonkeyPatch.context() as mp:
+                ref_outputs[attention_backend] = _get_baseline_results(
+                    mp,
+                    sampling_config,
+                    model_name,
+                    test_prompts,
+                    max_num_seqs=10,
+                    extra_kwargs={
+                        "gpu_memory_utilization": 0.85,
+                        "attention_backend": attention_backend
+                    })
+        return test_prompts, ref_outputs[attention_backend]
+
+    return get
 
 
 @pytest.mark.parametrize(
-    "async_scheduling, enable_dp_attention",
+    "async_scheduling, enable_dp_attention, attention_backend",
     [
-        pytest.param(False, False, marks=pytest.mark.bvt),
-        (False, True),
-        (True, False),
-        pytest.param(True, True, marks=pytest.mark.bvt),
+        pytest.param(False, False, None, marks=pytest.mark.bvt),
+        (False, True, None),
+        (True, False, None),
+        pytest.param(True, True, None, marks=pytest.mark.bvt),
+        (True, False, "flywheel"),
     ],
 )
 def test_dflash_correctness(
@@ -534,12 +547,16 @@ def test_dflash_correctness(
     sampling_config: SamplingParams,
     async_scheduling: bool,
     enable_dp_attention: bool,
-    dflash_baseline: tuple,
+    attention_backend: str | None,
+    dflash_baseline: Callable[[str | None], tuple],
 ):
     """Compare the outputs of a original LLM and a speculative LLM.
 
     Should be the same when using DFlash speculative decoding.
     """
+    # The baseline runs before this test sets MODEL_IMPL_TYPE, as it did
+    # when the fixture computed it.
+    test_prompts, ref_outputs = dflash_baseline(attention_backend)
     model_name = 'meta-llama/Llama-3.1-8B-Instruct'
 
     model_impl = os.environ.get("MODEL_IMPL_TYPE", "flax_nnx")
@@ -552,7 +569,6 @@ def test_dflash_correctness(
         "method": "dflash",
         "draft_tensor_parallel_size": 1
     }
-    test_prompts, ref_outputs = dflash_baseline
 
     _test_correctness_helper(monkeypatch,
                              sampling_config,
@@ -563,7 +579,10 @@ def test_dflash_correctness(
                              max_num_seqs=10,
                              async_scheduling=async_scheduling,
                              enable_dp_attention=enable_dp_attention,
-                             extra_kwargs={"gpu_memory_utilization": 0.85})
+                             extra_kwargs={
+                                 "gpu_memory_utilization": 0.85,
+                                 "attention_backend": attention_backend
+                             })
 
 
 @pytest.mark.parametrize(

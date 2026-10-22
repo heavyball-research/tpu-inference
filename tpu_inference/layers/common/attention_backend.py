@@ -76,6 +76,11 @@ class AttentionBackend(abc.ABC):
     executable per token bucket, as for RPA, so the metadata holds only device
     arrays: a static field would compile one executable per value."""
 
+    # Note: the most query tokens of a request in the runner's decode segment
+    # (the leading request_distribution[0] requests). A backend that attends
+    # speculative verify windows on its decode kernel raises it in configure.
+    max_decode_query_len: int = 1
+
     @abc.abstractmethod
     def get_kv_cache_shape(self, total_num_pages: int, page_size: int,
                            num_kv_heads: int, head_dim: int,
@@ -112,6 +117,10 @@ class AttentionBackend(abc.ABC):
         """Raise for an engine configuration this backend cannot serve. It may
         adjust the configuration, e.g. the block size. Runs in
         TpuPlatform.check_and_update_config, before any worker starts."""
+
+    def configure(self, vllm_config: "VllmConfig") -> None:
+        """Read what the kernels need from the engine configuration; the
+        runner calls it once on its backend."""
 
     def prepare_step(self, step: HostStepInputs,
                      device_buffer: "DeviceBuffer") -> None:
@@ -169,6 +178,16 @@ class RPAAttentionBackend(AttentionBackend):
             import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
         return rpa.get_kv_cache_shape(total_num_pages, page_size, num_kv_heads,
                                       head_dim, kv_dtype)
+
+    def configure(self, vllm_config: "VllmConfig") -> None:
+        # Note: the batched kernel attends a speculative verify window,
+        # num_speculative_tokens + 1 tokens at most, as a decode request.
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None or not envs.USE_BATCHED_RPA_KERNEL:
+            self.max_decode_query_len = 1
+        else:
+            self.max_decode_query_len = (
+                speculative_config.num_speculative_tokens + 1)
 
     def attention(self, *args, **kwargs) -> tuple["jax.Array", "jax.Array"]:
         # Note: imported here so that the platform, which imports this module,
@@ -258,11 +277,19 @@ def attention_backend_name(vllm_config: "VllmConfig") -> str:
     return RPAAttentionBackend.name
 
 
+ATTENTION_BACKENDS: dict[str, AttentionBackend] = {}
+
+
 def create_attention_backend(name: str) -> AttentionBackend:
-    """The attention backend of that name."""
-    if name == RPAAttentionBackend.name:
-        return RPAAttentionBackend()
-    return _REGISTERED_BACKENDS[name].attention()
+    """The attention backend of that name. One instance per name, so the
+    vLLM layers, which look their backend up by name, run the one the runner
+    configured."""
+    if name not in ATTENTION_BACKENDS:
+        if name == RPAAttentionBackend.name:
+            ATTENTION_BACKENDS[name] = RPAAttentionBackend()
+        else:
+            ATTENTION_BACKENDS[name] = _REGISTERED_BACKENDS[name].attention()
+    return ATTENTION_BACKENDS[name]
 
 
 def create_linear_attention_backend(name: str) -> LinearAttentionBackend:
@@ -299,14 +326,4 @@ def check_attention_backend_config(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             f"--attention-backend {name} supports a single host with forked "
             f"processes only, not: {', '.join(reasons)}.")
-    # A JAX (flax_nnx) model's attention layers run RPA, whatever KV cache
-    # layout the runner allocates. Imported here: model_loader imports
-    # vllm.config, which loads TpuPlatform, which imports this module.
-    from tpu_inference.models.common.model_loader import \
-        resolve_model_impl_type
-    if resolve_model_impl_type(vllm_config) != "vllm":
-        raise ValueError(
-            f"--attention-backend {name} runs in vLLM models only, but "
-            f"MODEL_IMPL_TYPE={envs.MODEL_IMPL_TYPE} resolves to flax_nnx for "
-            "this model. Set MODEL_IMPL_TYPE=vllm.")
     create_attention_backend(name).check_config(vllm_config)

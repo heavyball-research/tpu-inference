@@ -130,7 +130,7 @@ class FlywheelTpuWrapperTest(jtu.JaxTestCase):
                                           num_tokens)
         kernel_index = jnp.array([fa.step_kernels(num_tokens).index(kernel)],
                                  jnp.int32)
-        static_kwargs = dict(sm_scale=sm_scale)
+        static_kwargs = dict(sm_scale=sm_scale, max_decode_query_len=1)
         run = jax.jit(fa.flywheel_tpu_attention,
                       static_argnames=tuple(static_kwargs),
                       donate_argnums=(3, ))

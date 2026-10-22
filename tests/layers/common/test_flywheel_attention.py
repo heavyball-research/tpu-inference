@@ -123,7 +123,10 @@ class TestDispatch:
         assert kv_write_slices.shape == (3 * KV_WRITE_BOUND, )
         assert kv_write_num_slices.shape == (1, )
         np.testing.assert_array_equal(distribution, [0, 0, NUM_SEQS])
-        assert kwargs == {"sm_scale": HEAD_DIM**-0.5}
+        assert kwargs == {
+            "sm_scale": HEAD_DIM**-0.5,
+            "max_decode_query_len": 1
+        }
         assert output.shape == (TOTAL_TOKENS, NUM_HEADS, HEAD_DIM)
         assert kv_cache.shape == (NUM_BLOCKS, BLOCK_SIZE, 2 * NUM_KV_HEADS,
                                   HEAD_DIM)

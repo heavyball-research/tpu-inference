@@ -249,3 +249,22 @@ def test_default_backend_has_no_step_metadata():
                                  dp_size=1,
                                  mesh=None,
                                  sharding=None) == {}
+
+
+@pytest.mark.parametrize(("batched", "num_speculative_tokens", "expected"), [
+    ("0", None, 1),
+    ("0", 3, 1),
+    ("1", None, 1),
+    ("1", 3, 4),
+])
+def test_batched_rpa_takes_verify_windows_as_decode_requests(
+        monkeypatch, batched, num_speculative_tokens, expected):
+    monkeypatch.setenv("USE_BATCHED_RPA_KERNEL", batched)
+    speculative_config = (None if num_speculative_tokens is None else
+                          SimpleNamespace(
+                              num_speculative_tokens=num_speculative_tokens))
+    backend = RPAAttentionBackend()
+
+    backend.configure(SimpleNamespace(speculative_config=speculative_config))
+
+    assert backend.max_decode_query_len == expected
