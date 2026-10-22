@@ -122,22 +122,10 @@ def test_rejects_a_config_that_crosses_a_process_boundary(
 @pytest.mark.parametrize(("impl_type", "architecture"), [
     ("flax_nnx", "Qwen3_5ForConditionalGeneration"),
     ("auto", "Qwen3ForCausalLM"),
-])
-def test_rejects_a_jax_model(monkeypatch, impl_type, architecture):
-    monkeypatch.setenv("MODEL_IMPL_TYPE", impl_type)
-
-    with pytest.raises(ValueError,
-                       match=f"MODEL_IMPL_TYPE={impl_type} resolves to "
-                       "flax_nnx"):
-        attention_backend.check_attention_backend_config(
-            make_vllm_config(architecture))
-
-
-@pytest.mark.parametrize(("impl_type", "architecture"), [
     ("auto", "Qwen3_5ForConditionalGeneration"),
     ("vllm", "Qwen3ForCausalLM"),
 ])
-def test_accepts_a_vllm_model(monkeypatch, impl_type, architecture):
+def test_accepts_jax_and_vllm_models(monkeypatch, impl_type, architecture):
     monkeypatch.setenv("MODEL_IMPL_TYPE", impl_type)
     monkeypatch.setattr(FlywheelAttentionBackend, "check_config",
                         lambda self, vllm_config: None)
