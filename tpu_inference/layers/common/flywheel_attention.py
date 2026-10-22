@@ -342,12 +342,12 @@ def paged_cache_windows(
     num_active: jax.Array,  # i32 scalar: leading requests that are windows
     *,
     window_len: int,
-    causal: bool,
     sm_scale: float,
 ) -> tuple[jax.Array, jax.Array]:
-    """Attention of the leading num_active requests, each at most window_len
-    tokens already in the pages, as (num_windows, window_len) windows on the
-    decode kernel; rows of other requests come back unspecified.
+    """Causal attention of the leading num_active requests, each at most
+    window_len tokens already in the pages, as (num_windows, window_len)
+    windows on the decode kernel; rows of other requests come back
+    unspecified.
 
     Each request's rows sit right-aligned in its window, padding slots first,
     so the bottom-right causal bound puts row i of a q_len-token window at its
@@ -372,7 +372,7 @@ def paged_cache_windows(
         block_table=page_indices[:num_windows * pages_per_seq].reshape(
             num_windows, pages_per_seq),
         num_active=num_active,
-        causal=causal,
+        causal=True,
         softmax_scale=sm_scale,
     )
     row = jnp.arange(num_rows)
@@ -384,30 +384,6 @@ def paged_cache_windows(
         num_windows * window_len - 1)
     return output.reshape(num_windows * window_len,
                           *output.shape[2:])[window_slot], cache
-
-
-def append_rows_at_kv_lens(
-    cache: jax.Array,
-    k: jax.Array,  # [T, H, D]
-    v: jax.Array,  # [T, H, D]
-    kv_lens: jax.Array,  # i32[max_num_seqs], includes these rows
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    num_requests: jax.Array,  # i32 scalar
-) -> jax.Array:
-    """Writes the leading num_requests requests' K/V rows at the positions
-    kv_lens gives on the device."""
-    return append_ragged(cache,
-                         k,
-                         v,
-                         cu_q_lens,
-                         kv_lens - (cu_q_lens[1:] - cu_q_lens[:-1]),
-                         page_indices,
-                         num_requests.reshape(1),
-                         page_size=cache.shape[1],
-                         pages_per_seq=page_indices.shape[0] //
-                         kv_lens.shape[0],
-                         interpret=False)
 
 
 def pad_head_dim(q: jax.Array, k: jax.Array,
@@ -625,8 +601,17 @@ def flywheel_tpu_attention(
         # rejected ones from kv_lens afterwards (_subtract_num_rejected_tokens),
         # so the writer's host-built slices would put a window's K/V past its
         # place.
-        cache = append_rows_at_kv_lens(cache, padded_k, padded_v, kv_lens,
-                                       page_indices, cu_q_lens, num_decode)
+        cache = append_ragged(cache,
+                              padded_k,
+                              padded_v,
+                              cu_q_lens,
+                              kv_lens - (cu_q_lens[1:] - cu_q_lens[:-1]),
+                              page_indices,
+                              num_decode.reshape(1),
+                              page_size=cache.shape[1],
+                              pages_per_seq=page_indices.shape[0] //
+                              kv_lens.shape[0],
+                              interpret=False)
         decode_output, cache = paged_cache_windows(
             padded_q,
             cache,
@@ -635,7 +620,6 @@ def flywheel_tpu_attention(
             cu_q_lens,
             num_decode,
             window_len=max_decode_query_len,
-            causal=True,
             sm_scale=sm_scale)
         num_decode_rows = cu_q_lens[num_decode]
 
@@ -714,46 +698,53 @@ def flywheel_tpu_device_attention(
     window_len: int,
 ) -> tuple[jax.Array, jax.Array]:
     """One shard's attention over rows the step's host metadata does not
-    describe, e.g. a draft model's own tokens, from the device-side lengths:
-    each request as one window of at most window_len rows, or with
-    window_len 1 the packed rows on the paged varlen kernel. Rows past the
-    requests' are 0."""
+    describe, e.g. a draft model's own tokens, from the device-side lengths.
+    flash_attn_with_kvcache appends the rows and attends them: with
+    window_len > 1 every request is exactly window_len rows (a DFlash noise
+    block), else the rows are packed by cu_q_lens. Rows past the requests'
+    are 0."""
     head_dim = q.shape[-1]
     padded_q, padded_k, padded_v = pad_head_dim(q, k, v)
     num_active = request_distribution[2]
     max_num_seqs = kv_lens.shape[0]
-    page_size = kv_cache.shape[1]
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
-    cache = append_rows_at_kv_lens(kv_cache, padded_k, padded_v, kv_lens,
-                                   page_indices, cu_q_lens, num_active)
+    block_table = page_indices.reshape(max_num_seqs, -1)
     if window_len > 1:
-        output, cache = paged_cache_windows(padded_q,
-                                            cache,
-                                            kv_lens,
-                                            page_indices,
-                                            cu_q_lens,
-                                            num_active,
-                                            window_len=window_len,
-                                            causal=causal,
-                                            sm_scale=sm_scale)
-        row_index = jnp.arange(output.shape[0])[:, None, None]
-        output = jnp.where(row_index < cu_q_lens[num_active], output, 0)
-    else:
-        output = flash_attn_varlen_func(
-            padded_q.transpose(1, 0, 2),
-            cache,
+        if padded_q.shape[0] != max_num_seqs * window_len:
+            raise ValueError(
+                f"Windows of {window_len} rows need {max_num_seqs} * "
+                f"{window_len} rows; got {padded_q.shape[0]}.")
+        # Note: every request is a full window, so the rows reshape into
+        # (requests, window_len) as they are.
+        def _windows(x: jax.Array) -> jax.Array:
+            return x.reshape(max_num_seqs, window_len, *x.shape[1:])
+
+        output, cache = flash_attn_with_kvcache(
+            _windows(padded_q),
+            kv_cache,
             None,
-            cu_q_lens,
-            None,
-            max_seqlen_q=padded_q.shape[0],
-            max_seqlen_k=pages_per_seq * page_size,
-            softmax_scale=sm_scale,
-            causal=causal,
-            token_major=False,
-            block_table=page_indices.reshape(max_num_seqs, pages_per_seq),
-            seqused_k=kv_lens,
+            _windows(padded_k),
+            _windows(padded_v),
+            cache_seqlens=kv_lens - window_len,
+            block_table=block_table,
             num_active=num_active,
-        ).transpose(1, 0, 2)
+            causal=causal,
+            softmax_scale=sm_scale,
+        )
+        output = output.reshape(padded_q.shape)
+    else:
+        output, cache = flash_attn_with_kvcache(
+            padded_q,
+            kv_cache,
+            None,
+            padded_k,
+            padded_v,
+            cache_seqlens=kv_lens - (cu_q_lens[1:] - cu_q_lens[:-1]),
+            block_table=block_table,
+            num_active=num_active,
+            cu_seqlens_q=cu_q_lens,
+            causal=causal,
+            softmax_scale=sm_scale,
+        )
     return output[..., :head_dim], cache
 
 
