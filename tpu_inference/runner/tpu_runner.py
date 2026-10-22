@@ -1169,8 +1169,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             is_spec_decode=bool(self.vllm_config.speculative_config),
             num_speculative_tokens=num_speculative_tokens,
             dp_size=self.dp_size,
-            backend_max_decode_tokens=(
-                self.attention_backend.max_decode_query_len),
+            max_decode_tokens=self.attention_backend.max_decode_query_len,
         )
 
         self.positions_cpu = np.zeros(self.max_num_tokens, dtype=np.int32)

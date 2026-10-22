@@ -76,9 +76,9 @@ class AttentionBackend(abc.ABC):
     executable per token bucket, as for RPA, so the metadata holds only device
     arrays: a static field would compile one executable per value."""
 
-    # Note: a backend that attends speculative verify windows on its decode
-    # kernel raises this in configure, so the runner keeps those requests in
-    # the decode segment.
+    # Note: the most query tokens of a request in the runner's decode segment
+    # (the leading request_distribution[0] requests). A backend that attends
+    # speculative verify windows on its decode kernel raises it in configure.
     max_decode_query_len: int = 1
 
     @abc.abstractmethod
@@ -178,6 +178,16 @@ class RPAAttentionBackend(AttentionBackend):
             import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
         return rpa.get_kv_cache_shape(total_num_pages, page_size, num_kv_heads,
                                       head_dim, kv_dtype)
+
+    def configure(self, vllm_config: "VllmConfig") -> None:
+        # Note: the batched kernel attends a speculative verify window,
+        # num_speculative_tokens + 1 tokens at most, as a decode request.
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None or not envs.USE_BATCHED_RPA_KERNEL:
+            self.max_decode_query_len = 1
+        else:
+            self.max_decode_query_len = (
+                speculative_config.num_speculative_tokens + 1)
 
     def attention(self, *args, **kwargs) -> tuple["jax.Array", "jax.Array"]:
         # Note: imported here so that the platform, which imports this module,
