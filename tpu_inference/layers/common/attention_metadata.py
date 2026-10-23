@@ -67,6 +67,7 @@ class PCPMetadata:
         "query_start_loc",
         "request_distribution",
         "mamba_state_indices",
+        "mamba_replay_lens",
         "pcp",
         "backend_metadata",
     ],
@@ -97,6 +98,11 @@ class AttentionMetadata(object):
     # None for models without mamba layers; pure-mamba models would also
     # use this field, only hybrid models exercise it today.
     mamba_state_indices: jax.Array | None = None
+    # (max_num_seqs,) int32 — the ReplaySSM records each request has
+    # committed in its mamba slot, laid out like mamba_state_indices.
+    # None unless additional_config.flywheel_gdn_replay_window turns replay
+    # on (see layers/common/flywheel_gdn_replay.py).
+    mamba_replay_lens: jax.Array | None = None
 
     # PCP-specific metadata. None when not running prefill context parallelism.
     pcp: PCPMetadata | None = None

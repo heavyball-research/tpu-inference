@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from flywheel_tpu import flash_attn_func, flash_attn_with_kvcache
 from flywheel_tpu.flash_attn_interface import PAGE_SIZE_MULTIPLE
+from flywheel_tpu.linear_attention.gdn import config as gdn_config
 from flywheel_tpu.pallas.block_sizes import FWD_BLOCKS, NUM_LANES
 from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
 from jax import lax
@@ -39,6 +40,8 @@ from tpu_inference.layers.common.attention_backend import (AttentionBackend,
                                                            HostStepInputs)
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
+from tpu_inference.layers.common.flywheel_gdn_replay import (
+    GDN_REPLAY_WINDOW_KEY, gdn_replay_window)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import (DeviceBuffer, align_to, device_array,
@@ -746,11 +749,59 @@ class FlywheelAttentionBackend(AttentionBackend):
         if model_config.dtype != torch.bfloat16:
             problems.append(
                 f"model dtype {model_config.dtype} is not bfloat16")
+        problems.extend(self._check_gdn_replay_config(vllm_config))
 
         if problems:
             raise ValueError(
                 "The flywheel attention backend cannot serve this "
                 "configuration: " + "; ".join(problems) + ".")
+
+    @staticmethod
+    def _check_gdn_replay_config(vllm_config: "VllmConfig") -> list[str]:
+        """Set the recurrent state dtype ReplaySSM decode of the GDN layers
+        needs, if the user left it to vLLM, and list what else replay cannot
+        serve; nothing when replay is off."""
+        replay_window = gdn_replay_window(vllm_config)
+        if replay_window is None:
+            return []
+        cache_config = vllm_config.cache_config
+        key = f"additional_config.{GDN_REPLAY_WINDOW_KEY}"
+        problems: list[str] = []
+        # Note: the record buffer moves in whole sublane tiles.
+        if (not isinstance(replay_window, int)
+                or isinstance(replay_window, bool) or replay_window <= 0
+                or replay_window % gdn_config.SUBLANE_ALIGN):
+            problems.append(
+                f"{key} {replay_window!r} is not a positive multiple of "
+                f"{gdn_config.SUBLANE_ALIGN}")
+        if not vllm_config.model_config.is_hybrid:
+            problems.append(f"{key} needs a model with GDN layers")
+        # Note: a replay slot holds a checkpoint plus records, never the
+        # whole state that align mode caches per block.
+        if cache_config.mamba_cache_mode != "none":
+            problems.append(f"{key} needs mamba_cache_mode 'none', not "
+                            f"{cache_config.mamba_cache_mode!r}; pass "
+                            "--no-enable-prefix-caching")
+        # Note: InputBatch.is_decode tells a prompt's middle 1-token chunk
+        # from a decode by the token ids the runner knows, which a pipeline
+        # stage other than the last receives one chunk at a time.
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            problems.append(f"{key} does not support pipeline parallelism")
+        # Note: the kernel folds the records into an f32 checkpoint. Qwen3.5
+        # has set the dtype from its HF config already (vLLM's model config
+        # hooks run before the platform's).
+        if cache_config.mamba_ssm_cache_dtype == "auto":
+            logger.info(
+                "ReplaySSM decode of the GDN layers keeps an f32 recurrent "
+                "checkpoint; setting mamba_ssm_cache_dtype from 'auto' to "
+                "'float32'.")
+            cache_config.mamba_ssm_cache_dtype = "float32"
+        elif cache_config.mamba_ssm_cache_dtype != "float32":
+            problems.append(
+                f"{key} needs a float32 recurrent state, not "
+                f"mamba_ssm_cache_dtype {cache_config.mamba_ssm_cache_dtype!r}"
+            )
+        return problems
 
     def get_kv_cache_shape(self, total_num_pages: int, page_size: int,
                            num_kv_heads: int, head_dim: int,

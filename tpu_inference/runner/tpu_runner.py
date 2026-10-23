@@ -55,6 +55,8 @@ from tpu_inference.layers.common.attention_backend import (
     HostStepInputs, attention_backend_name, create_attention_backend)
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
+from tpu_inference.layers.common.flywheel_gdn_replay import (
+    gdn_replay_window, next_gdn_replay_lens)
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   MESH_AXIS_NAMES_2D,
                                                   ShardingAxisName,
@@ -801,6 +803,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # --attention-backend selects.
         self.attention_backend = create_attention_backend(
             attention_backend_name(vllm_config))
+        # The ReplaySSM window of the GDN layers' decode, or None when replay
+        # is off.
+        self.gdn_replay_window = gdn_replay_window(vllm_config)
         self.model_config = vllm_config.model_config
         # TODO(jevinjiang): override block size based on RPA v3.
         self.cache_config = vllm_config.cache_config
@@ -1163,6 +1168,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             is_spec_decode=bool(self.vllm_config.speculative_config),
             num_speculative_tokens=num_speculative_tokens,
             dp_size=self.dp_size,
+            gdn_replay=self.gdn_replay_window is not None,
         )
 
         self.positions_cpu = np.zeros(self.max_num_tokens, dtype=np.int32)
@@ -3015,17 +3021,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         positions = self.positions_cpu[:padded_total_num_scheduled_tokens]
         mrope_positions = self.mrope_positions_cpu[:, :
                                                    padded_total_num_scheduled_tokens]
-        max_decode_tokens = self.input_batch.max_decode_tokens
 
         _request_distribution = []
         for dp_rank in range(dp_size):
             _num_reqs = num_req_per_dp_rank[dp_rank]
             # The batch has been reordered by _reorder_batch so decode requests come first
-            # Count decode requests (those with num_scheduled_tokens <= max_decode_tokens) in this DP rank
+            # Count decode requests (InputBatch.is_decode) in this DP rank
             num_decode_in_dp_rank = 0
-            for req_id in req_ids_dp[dp_rank]:
-                if scheduler_output.num_scheduled_tokens[
-                        req_id] <= max_decode_tokens:
+            for req_index, num_scheduled_tokens in zip(
+                    req_indices_dp[dp_rank],
+                    scheduled_tokens_per_dp_rank[dp_rank]):
+                if self.input_batch.is_decode(req_index, num_scheduled_tokens):
                     num_decode_in_dp_rank += 1
             _request_distribution.append(
                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
@@ -3163,6 +3169,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             local_slots = self.input_batch._mamba_local_slots
             mamba_state_indices_cpu = np.zeros(self.max_num_reqs,
                                                dtype=np.int32)
+            # ReplaySSM: each request's committed records, in the same
+            # per-DP-rank layout as the slots.
+            mamba_replay_lens_cpu = (None if self.gdn_replay_window is None
+                                     else np.zeros(self.max_num_reqs,
+                                                   dtype=np.int32))
             for dp_rank in range(dp_size):
                 _num_reqs = num_req_per_dp_rank[dp_rank]
                 if _num_reqs == 0:
@@ -3173,13 +3184,40 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mamba_state_indices_cpu[req_offset:req_offset +
                                         _num_reqs] = (global_slots %
                                                       local_slots)
-            (request_distribution, mamba_state_indices,
-             dev_arrays_payload) = device_array(
-                 self.mesh, (request_distribution, mamba_state_indices_cpu,
-                             metadata_blob),
-                 sharding=metadata_attn_sharding)
+                if mamba_replay_lens_cpu is not None:
+                    req_indices = req_indices_dp[dp_rank]
+                    replay_lens = self.input_batch.mamba_replay_lens_cpu[
+                        req_indices]
+                    mamba_replay_lens_cpu[req_offset:req_offset +
+                                          _num_reqs] = replay_lens
+                    # Note: the records are advanced to the next step as
+                    # soon as this one is prepared, from the seq_lens and
+                    # query lengths the kernel sees. Every prepared step runs,
+                    # in order, also under async scheduling.
+                    self.input_batch.mamba_replay_lens_cpu[
+                        req_indices] = next_gdn_replay_lens(
+                            replay_lens,
+                            np.asarray(scheduled_tokens_per_dp_rank[dp_rank],
+                                       dtype=np.int32),
+                            seq_lens_view[req_offset:req_offset + _num_reqs],
+                            num_decode=int(request_distribution[3 * dp_rank]),
+                            replay_window=self.gdn_replay_window)
+            if mamba_replay_lens_cpu is None:
+                mamba_replay_lens = None
+                (request_distribution, mamba_state_indices,
+                 dev_arrays_payload) = device_array(
+                     self.mesh, (request_distribution, mamba_state_indices_cpu,
+                                 metadata_blob),
+                     sharding=metadata_attn_sharding)
+            else:
+                (request_distribution, mamba_state_indices, mamba_replay_lens,
+                 dev_arrays_payload) = device_array(
+                     self.mesh, (request_distribution, mamba_state_indices_cpu,
+                                 mamba_replay_lens_cpu, metadata_blob),
+                     sharding=metadata_attn_sharding)
         else:
             mamba_state_indices = None
+            mamba_replay_lens = None
             (request_distribution, dev_arrays_payload) = device_array(
                 self.mesh, (request_distribution, metadata_blob),
                 sharding=metadata_attn_sharding)
@@ -3207,6 +3245,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
+                mamba_replay_lens=mamba_replay_lens,
                 padded_num_reqs=attn_padded_num_reqs,
                 pcp=pcp_metadata,
                 backend_metadata=self.attention_backend.backend_metadata(

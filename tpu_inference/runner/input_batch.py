@@ -36,6 +36,9 @@ class CachedRequestState(NewRequestData):
     # [num_prompt_tokens-1, ...]. Set to None when prefill completes.
     in_progress_prompt_logprobs_cpu: Optional[tuple] = None
     mamba_state_slot: Optional[int] = None
+    # The ReplaySSM records committed in mamba_state_slot, kept with the slot
+    # while the request is out of the persistent batch.
+    mamba_replay_len: int = 0
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -64,9 +67,13 @@ class InputBatch:
         is_spec_decode: bool = False,
         num_speculative_tokens: int = 0,
         dp_size: int = 1,
+        gdn_replay: bool = False,
     ):
         self.is_spec_decode = is_spec_decode
         self.num_speculative_tokens = num_speculative_tokens
+        # Whether the GDN layers decode with ReplaySSM, which narrows the
+        # decode segment (see `is_decode`).
+        self.gdn_replay = gdn_replay
         self.max_num_reqs = max_num_reqs
         self.dp_size = dp_size
         self.max_model_len = max_model_len
@@ -173,6 +180,13 @@ class InputBatch:
         # Initial pool size is based on max_num_reqs rounded up to dp_size;
         # init_mamba_pools() resizes after KV cache allocation is known.
         self.mamba_state_indices_cpu = np.zeros(max_num_reqs, dtype=np.int32)
+        # Per-request ReplaySSM records committed in its mamba slot (see
+        # layers/common/flywheel_gdn_replay.py), maintained like
+        # mamba_state_indices_cpu: it follows the request through
+        # `swap_states` and `condense`, and the slot when the slot is kept.
+        # The runner advances it as it prepares each step; it stays 0 when
+        # replay is off.
+        self.mamba_replay_lens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
         # Mamba slot pool, partitioned by DP rank so each rank's requests
         # get slots within that rank's shard of the device-side state array.
         # Matches the sharding in kv_cache_manager: mamba_num_blocks is
@@ -390,6 +404,8 @@ class InputBatch:
         if request.mamba_state_slot is None:
             request.mamba_state_slot = self._free_mamba_slots_per_rank[
                 dp_rank].pop()
+            # A fresh slot holds no records of this request.
+            request.mamba_replay_len = 0
         else:
             slot_rank = int(
                 request.mamba_state_slot) // self._mamba_local_slots
@@ -400,6 +416,7 @@ class InputBatch:
             if request.mamba_state_slot in pool:
                 pool.remove(request.mamba_state_slot)
         self.mamba_state_indices_cpu[req_index] = request.mamba_state_slot
+        self.mamba_replay_lens_cpu[req_index] = request.mamba_replay_len
 
         # NOTE(woosuk): self.generators should not include the requests that
         # do not have their own generator.
@@ -513,6 +530,7 @@ class InputBatch:
         # state corruption. See
         # `test_mamba_state_indices_no_duplicate_in_padded_tail`.
         self.mamba_state_indices_cpu[req_index] = 0
+        self.mamba_replay_lens_cpu[req_index] = 0
 
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
@@ -593,6 +611,10 @@ class InputBatch:
             self.mamba_state_indices_cpu[i2],
             self.mamba_state_indices_cpu[i1],
         )
+        self.mamba_replay_lens_cpu[i1], self.mamba_replay_lens_cpu[i2] = (
+            self.mamba_replay_lens_cpu[i2],
+            self.mamba_replay_lens_cpu[i1],
+        )
 
     def condense(self, empty_req_indices: list[int]) -> None:
         num_reqs = self.num_reqs
@@ -646,6 +668,9 @@ class InputBatch:
             # leaving it here too would put a duplicate in the padded tail
             # (see the trace in `remove_request`).
             self.mamba_state_indices_cpu[last_req_index] = 0
+            self.mamba_replay_lens_cpu[
+                empty_index] = self.mamba_replay_lens_cpu[last_req_index]
+            self.mamba_replay_lens_cpu[last_req_index] = 0
             self.temperature_cpu[empty_index] = self.temperature_cpu[
                 last_req_index]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
@@ -692,6 +717,32 @@ class InputBatch:
         if self.is_spec_decode and envs.USE_BATCHED_RPA_KERNEL:
             return self.num_speculative_tokens + 1
         return 1
+
+    def is_decode(self, req_index, num_scheduled_tokens):
+        """Whether requests run in the decode segment of the step, elementwise
+        over numpy arrays (or for one request): they schedule at most
+        max_decode_tokens tokens and, under ReplaySSM, the step reaches the
+        last token id the host knows (it samples a token).
+
+        Note: vLLM can give a prompt a 1-token chunk in its middle when
+        the token budget runs out. Under ReplaySSM a decode commits its token
+        as a record, which the prompt's next chunk (a prefill) would not read,
+        so such a chunk runs in the mixed segment, which writes the whole
+        state. num_tokens_no_spec counts the outputs a resumed request
+        recomputes and, under async scheduling, the placeholder of the token
+        the previous step samples.
+
+        Args:
+            req_index: The requests' indices in the batch.
+            num_scheduled_tokens: Their scheduled tokens in the step.
+        """
+        is_decode = num_scheduled_tokens <= self.max_decode_tokens
+        if self.gdn_replay:
+            seq_lens = (self.num_computed_tokens_cpu[req_index] +
+                        num_scheduled_tokens)
+            is_decode = is_decode & (seq_lens
+                                     >= self.num_tokens_no_spec[req_index])
+        return is_decode
 
     @property
     def max_num_logprobs(self) -> Optional[int]:

@@ -31,6 +31,7 @@ from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
@@ -746,6 +747,7 @@ class KVCacheManager:
                 block_sizes=block_sizes,
                 num_speculative_tokens=num_speculative_tokens,
                 dp_size=self.runner.dp_size,
+                gdn_replay=self.runner.gdn_replay_window is not None,
             )
             self.runner.input_batch = new_input_batch
             self.runner.persistent_batch_manager.input_batch = new_input_batch
@@ -956,6 +958,17 @@ class KVCacheManager:
             num_blocks = slot_num_blocks[slot_key]
 
             if isinstance(layer_spec, MambaSpec):
+                # ReplaySSM: a GDN layer keeps its recurrent state as the
+                # checkpoint's hi and lo planes, and also its records and their
+                # gates (VllmGatedDeltaNetAttention).
+                is_gdn_replay = self.runner.gdn_replay_window is not None
+                if is_gdn_replay and (layer_spec.mamba_type
+                                      != MambaAttentionBackendEnum.GDN_ATTN
+                                      or len(layer_spec.shapes) != 4):
+                    raise ValueError(
+                        "ReplaySSM decode runs GDN layers only; layer "
+                        f"{first_layer_name} is {layer_spec.mamba_type.name} "
+                        f"with {len(layer_spec.shapes)} states.")
                 mamba_states = []
                 for state_index, (shape, dtype) in enumerate(
                         zip(layer_spec.shapes, layer_spec.dtypes)):
@@ -965,11 +978,22 @@ class KVCacheManager:
                         # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
                                              ShardingAxisName.ATTN_HEAD)
+                    elif is_gdn_replay and state_index == 1:
+                        # replay checkpoint: [num_blocks, 2, num_heads,
+                        # head_dim // 2, state_size], its hi and lo planes
+                        spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                                             ShardingAxisName.ATTN_HEAD, None,
+                                             None)
                     elif state_index == 1:
                         # ssm_state: [num_blocks, num_heads, head_dim, state_size]
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                              ShardingAxisName.ATTN_HEAD, None,
                                              None)
+                    elif is_gdn_replay and state_index in (2, 3):
+                        # replay records and gates: [num_blocks,
+                        # replay_window, tp * dim], one layout per head shard
+                        spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                                             ShardingAxisName.ATTN_HEAD)
                     else:
                         spec = PartitionSpec(
                             None, *([None] * (len(cache_shape) - 1)))

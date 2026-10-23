@@ -83,7 +83,10 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from tpu_inference import envs
 from tpu_inference.layers.common.attention_backend import (
-    check_attention_backend_config, is_registered_attention_backend)
+    attention_backend_name, check_attention_backend_config,
+    is_registered_attention_backend)
+from tpu_inference.layers.common.flywheel_gdn_replay import (
+    GDN_REPLAY_WINDOW_KEY, gdn_replay_window)
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 
@@ -475,6 +478,14 @@ class TpuPlatform(Platform):
                         cache_config.block_size = min_page_size  # type: ignore[assignment]
 
         check_attention_backend_config(vllm_config)
+        from tpu_inference.layers.vllm.backends.flywheel import \
+            FLYWHEEL_BACKEND_NAME
+        if (gdn_replay_window(vllm_config) is not None and
+                attention_backend_name(vllm_config) != FLYWHEEL_BACKEND_NAME):
+            raise ValueError(
+                f"additional_config.{GDN_REPLAY_WINDOW_KEY} needs "
+                f"--attention-backend {FLYWHEEL_BACKEND_NAME}; got "
+                f"{attention_backend_name(vllm_config)}.")
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
