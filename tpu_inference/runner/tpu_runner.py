@@ -3140,7 +3140,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 query_start_loc=query_start_loc_view,
                 seq_lens=seq_lens_view,
                 request_distribution=request_distribution,
-                scheduled_tokens_per_dp_rank=scheduled_tokens_per_dp_rank,
                 dp_size=dp_size,
                 max_num_reqs_per_dp_rank=max_num_reqs_per_dp_rank,
                 padded_num_scheduled_tokens_per_dp_rank=(

@@ -54,19 +54,17 @@ def build_metadata() -> tuple[AttentionMetadata, SharedAttentionMetadata]:
     seq_lens = jnp.array([5, 5, 0, 0], jnp.int32)
     query_start_loc = jnp.array([0, 5, 10, 10, 10], jnp.int32)
     distribution = jnp.array([0, 0, NUM_SEQS], jnp.int32)
-    md = AttentionMetadata(input_positions=jnp.arange(TOTAL_TOKENS,
-                                                      dtype=jnp.int32),
-                           block_tables=jnp.zeros(
-                               (MAX_NUM_SEQS * MAX_BLOCKS_PER_SEQ, ),
+    md = AttentionMetadata(
+        input_positions=jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),
+        block_tables=jnp.zeros((MAX_NUM_SEQS * MAX_BLOCKS_PER_SEQ, ),
                                jnp.int32),
-                           seq_lens=seq_lens,
-                           query_start_loc=query_start_loc,
-                           request_distribution=distribution,
-                           backend_metadata=fa.FlywheelMetadata(
-                               kv_write_slices=jnp.zeros(
-                                   (3 * KV_WRITE_BOUND, ), jnp.int32),
-                               kv_write_num_slices=jnp.zeros((1, ), jnp.int32),
-                               kernel_index=jnp.zeros((1, ), jnp.int32)))
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        request_distribution=distribution,
+        backend_metadata=fa.FlywheelMetadata(kv_write_slices=jnp.zeros(
+            (3 * KV_WRITE_BOUND, ), jnp.int32),
+                                             kv_write_num_slices=jnp.zeros(
+                                                 (1, ), jnp.int32)))
     shared = SharedAttentionMetadata(input_positions=jnp.arange(
         TOTAL_TOKENS, dtype=jnp.int32),
                                      seq_lens=seq_lens,
@@ -116,10 +114,9 @@ class TestDispatch:
         wrapper, (kv_cache, output) = self.run_attention(mesh, monkeypatch)
         wrapper.assert_called_once()
         args, kwargs = wrapper.call_args
-        *_, kv_write_slices, kv_write_num_slices, distribution, kernel_index = args
+        *_, kv_write_slices, kv_write_num_slices, distribution = args
         assert args[0] is mesh
-        assert len(args) == 12
-        assert kernel_index.shape == (1, )
+        assert len(args) == 11
         assert kv_write_slices.shape == (3 * KV_WRITE_BOUND, )
         assert kv_write_num_slices.shape == (1, )
         np.testing.assert_array_equal(distribution, [0, 0, NUM_SEQS])
@@ -236,71 +233,20 @@ def test_kv_write_slices_match_a_token_by_token_reference(page_size, seed):
     np.testing.assert_array_equal(out[:, count:], 0)
 
 
-@pytest.mark.parametrize(("num_decode", "seq_lens", "phase"), [
-    (2, [(1, 300), (1, 129)], fa._DECODE_PHASE),
-    (0, [(300, 300), (129, 129)], fa._PREFILL_PHASE),
-    (1, [(1, 300), (129, 129)], fa._EXTEND_PHASE),
-    (0, [(200, 457)], fa._EXTEND_PHASE),
+@pytest.mark.parametrize(("num_decode", "q_lens"), [
+    (2, [1, 1]),
+    (0, [300, 129]),
+    (1, [1, 129]),
+    (0, []),
 ])
-def test_attention_phase(num_decode, seq_lens, phase):
-    q_lens = [q_len for q_len, _ in seq_lens]
-    cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)])
-    kv_lens = np.array([kv_len for _, kv_len in seq_lens])
-
-    assert fa.select_attention_phase(num_decode, cu_q_lens, kv_lens) == phase
+def test_decode_rows_first(num_decode, q_lens):
+    fa.check_decode_rows_first(num_decode,
+                               np.concatenate([[0], np.cumsum(q_lens)]))
 
 
-def test_attention_phase_needs_decode_rows_first():
+def test_decode_rows_first_rejects_a_prefill_ahead_of_them():
     with pytest.raises(ValueError, match="decode requests first"):
-        fa.select_attention_phase(1, np.array([0, 5, 6]), np.array([5, 9]))
-
-
-@pytest.mark.parametrize(
-    ("scheduled_tokens_per_dp_rank", "bucket", "dense"),
-    [
-        ([[1000]], 1024, True),
-        ([[100]], 1024, True),
-        ([[1000], [700]], 1024, True),
-        ([[500, 500]], 1024, False),
-        ([[1000], []], 1024, False),
-        # The dense kernel cannot tile these buckets.
-        ([[64]], 64, False),
-        ([[3000]], 3072, False),
-    ])
-def test_dense_prefill_for_one_request_per_rank(scheduled_tokens_per_dp_rank,
-                                                bucket, dense):
-    span = fa.varlen_block_span(scheduled_tokens_per_dp_rank, bucket)
-
-    assert fa.use_dense_prefill(scheduled_tokens_per_dp_rank, bucket,
-                                span) is dense
-
-
-@pytest.mark.parametrize(
-    ("scheduled_tokens_per_dp_rank", "bucket", "span"),
-    [
-        ([[128] * 16], 2048, 256),
-        ([[2048]], 2048, 1024),
-        # The DP ranks run concurrently and the step costs the slowest
-        # rank, so together they pick a span neither picks alone.
-        ([[128] * 16, [2048]], 2048, 512),
-        ([[100]], 128, 128),
-    ])
-def test_varlen_block_span(scheduled_tokens_per_dp_rank, bucket, span):
-    assert fa.varlen_block_span(scheduled_tokens_per_dp_rank, bucket) == span
-    assert span in fa.varlen_block_spans(bucket)
-
-
-def test_varlen_block_span_tie_goes_to_the_wider_span(monkeypatch):
-    monkeypatch.setattr(fa, "ragged_step_cost", lambda *args: 1)
-
-    assert fa.varlen_block_span([[1000]], 2048) == 2048
-
-
-def test_block_sizes_come_from_flywheel():
-    # The cost model was fitted with these, so a flywheel-tpu change to
-    # FWD_BLOCKS should be a deliberate change here as well.
-    assert fa._VARLEN_BLOCK_SPANS == (256, 512, 1024, 2048)
-    assert (fa._DENSE_PAD_MULTIPLE, fa._DENSE_MAX_BLOCK) == (128, 2048)
+        fa.check_decode_rows_first(1, np.array([0, 5, 6]))
 
 
 PAGE_SIZES = (128, 256)
@@ -350,22 +296,19 @@ def host_step(seq_lens_per_rank: list[list[tuple[int, int]]],
                                                        len(requests))
     rng = np.random.default_rng(0)
     num_pages = dp_size * MAX_REQS_PER_RANK * PAGES_PER_REQ
-    return HostStepInputs(
-        kv_cache_groups=kv_cache_groups(),
-        block_tables={
-            gid: rng.permutation(num_pages).reshape(-1, PAGES_PER_REQ)
-            for gid in range(len(PAGE_SIZES))
-        },
-        query_start_loc=query_start_loc,
-        seq_lens=seq_lens,
-        request_distribution=request_distribution,
-        scheduled_tokens_per_dp_rank={
-            rank: [q_len for q_len, _ in requests]
-            for rank, requests in enumerate(seq_lens_per_rank)
-        },
-        dp_size=dp_size,
-        max_num_reqs_per_dp_rank=MAX_REQS_PER_RANK,
-        padded_num_scheduled_tokens_per_dp_rank=bucket)
+    return HostStepInputs(kv_cache_groups=kv_cache_groups(),
+                          block_tables={
+                              gid:
+                              rng.permutation(num_pages).reshape(
+                                  -1, PAGES_PER_REQ)
+                              for gid in range(len(PAGE_SIZES))
+                          },
+                          query_start_loc=query_start_loc,
+                          seq_lens=seq_lens,
+                          request_distribution=request_distribution,
+                          dp_size=dp_size,
+                          max_num_reqs_per_dp_rank=MAX_REQS_PER_RANK,
+                          padded_num_scheduled_tokens_per_dp_rank=bucket)
 
 
 def prepare(step: HostStepInputs) -> dict[str, jax.Array]:
@@ -376,20 +319,13 @@ def prepare(step: HostStepInputs) -> dict[str, jax.Array]:
     return DeviceBuffer.unpack_arrays(jnp.asarray(blob), layout)
 
 
-def step_kernel(arrays: dict[str, jax.Array], bucket: int) -> str | int:
-    """The kernel prepare_step picked, the same on every DP rank."""
-    (index, ) = set(np.asarray(arrays[fa._KERNEL_INDEX_KEY]).tolist())
-    return fa.step_kernels(bucket)[index]
-
-
 class TestPrepareStep:
 
-    def test_dp_ranks_that_disagree_run_extend(self):
-        step = host_step([[(1, 300), (1, 129)], [(256, 256)]], bucket=256)
+    def test_rejects_a_rank_with_a_prefill_ahead_of_its_decode_rows(self):
+        step = host_step([[(1, 300)], [(256, 256), (1, 129)]], bucket=256)
 
-        arrays = prepare(step)
-
-        assert step_kernel(arrays, 256) == fa._EXTEND_PHASE
+        with pytest.raises(ValueError, match="decode requests first"):
+            prepare(step)
 
     def test_each_attention_group_gets_its_ranks_slice_tables(self):
         seq_lens_per_rank = [[(1, 300), (1, 129)], [(40, 700), (200, 457)]]
@@ -418,16 +354,6 @@ class TestPrepareStep:
                     slices[rank][:, :len(expected)].T,
                     np.array(expected, np.int32).reshape(-1, 3))
 
-    @pytest.mark.parametrize(("seq_lens_per_rank", "kernel"), [
-        ([[(1000, 1000)], [(700, 700)]], fa._DENSE_KERNEL),
-        ([[(500, 500), (500, 500)], [(700, 700)]], 512),
-        ([[(1, 300), (1, 129)], [(1, 50)]], fa._DECODE_PHASE),
-    ])
-    def test_picks_its_kernel_on_the_host(self, seq_lens_per_rank, kernel):
-        arrays = prepare(host_step(seq_lens_per_rank, bucket=1024))
-
-        assert step_kernel(arrays, 1024) == kernel
-
     # A decode step's bucket is the smallest one that fits a full
     # request batch, 2 * MAX_REQS_PER_RANK tokens over both ranks.
     @pytest.mark.parametrize(("seq_lens_per_rank", "bucket"), [
@@ -455,4 +381,3 @@ class TestPrepareStep:
                 jnp.shape,
                 backend.backend_metadata(arrays, gid)) == jax.tree.map(
                     jnp.shape, backend.backend_metadata(warmup_arrays, gid)))
-        assert step_kernel(arrays, bucket) in fa.step_kernels(bucket)
