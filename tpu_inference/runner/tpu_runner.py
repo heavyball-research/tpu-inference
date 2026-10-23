@@ -2470,10 +2470,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             n = local_indices.shape[0]
             if n <= chunk or local_array.ndim < 2:
                 return local_array[local_indices]
-            num_pads = (-n) % chunk
-            idx = jnp.pad(local_indices, (0, num_pads)).reshape(-1, chunk)
-            out = jax.lax.map(lambda ix: local_array[ix], idx)
-            return out.reshape(-1, *local_array.shape[1:])[:n]
+            return jnp.concatenate([
+                local_array[local_indices[start:start + chunk]]
+                for start in range(0, n, chunk)
+            ])
 
         ret = jax.shard_map(
             select_local_fn,
